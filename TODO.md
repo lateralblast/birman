@@ -27,6 +27,10 @@ described in the notice at the top of `README.md`.
   `/proc/<pid>/numa_maps` of a running process) and evicting automatically only then would remove that step.
 - [ ] `bitnet_b1_58-large` prompt processing at 16 threads was 0.71x slower with `--numa distribute` (466 against
   660 t/s). Every other case was within 10% or faster; not investigated.
+- [ ] `start_llama.py` defaults `-t` to the physical core count, which maximises generation; prompt-heavy workloads
+  gained a little from SMT threads on the Xeon (2B-4T pp128 516 at 64 threads against 416 at 32) and almost nothing
+  on the i9 (209 against 205). A `--prompt-heavy` option, or choosing by workload, is untested. On non-Linux systems
+  the thread count falls back to the logical CPU count, and only AVX2/ARM warnings are tuned for x86_64 and aarch64.
 - [ ] `run_inference_server.py` was only smoke-tested with the flag (starts, answers, 44.5 t/s on 2B-4T), not
   benchmarked under load.
 
