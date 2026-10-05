@@ -6,7 +6,6 @@ import platform
 import argparse
 import logging
 import shutil
-import json
 from pathlib import Path
 
 logger = logging.getLogger("setup_env")
@@ -113,26 +112,6 @@ def run_command(command, shell=False, log_step=None):
             logging.error(f"Error occurred while running command: {e}")
         sys.exit(1)
 
-def i2s_unsupported_tensor_args(model_dir):
-    """llama-quantize args for tensors the I2_S dot kernel cannot handle.
-
-    The kernel works on 128-element blocks per row and drops any tail, so a tensor whose row
-    length is not a multiple of 128 silently produces garbage. ffn_down rows are
-    intermediate_size long (e.g. 8640 for bitnet_b1_58-3B), so keep it at Q8_0 in that case.
-    """
-    try:
-        with open(os.path.join(model_dir, "config.json")) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError):
-        return []
-    args_out = []
-    if cfg.get("intermediate_size", 128) % 128 != 0:
-        logging.warning(f"intermediate_size={cfg['intermediate_size']} is not a multiple of 128: keeping ffn_down at Q8_0 (I2_S would produce garbage)")
-        args_out += ["--tensor-type", "ffn_down=q8_0"]
-    if cfg.get("hidden_size", 128) % 128 != 0:
-        logging.warning(f"hidden_size={cfg['hidden_size']} is not a multiple of 128: I2_S output will likely be garbage for this model")
-    return args_out
-
 def prepare_model():
     _, arch = system_info()
     hf_url = args.hf_repo
@@ -165,7 +144,6 @@ def prepare_model():
             cmd = [quantize_bin]
             if quant_embd:
                 cmd += ["--token-embedding-type", "f16"]
-            cmd += i2s_unsupported_tensor_args(model_dir)
             cmd += [f32_model, i2s_model, "I2_S", "1"]
             if quant_embd:
                 cmd.append("1")
@@ -243,16 +221,24 @@ def compile():
 
 def apply_patches():
     # Local fixes for the pinned llama.cpp submodule, kept in patches/llama.cpp/.
-    # Idempotent: patches that are already applied are skipped.
+    # Idempotent: patches that are already applied are skipped. Later patches may edit lines
+    # added by earlier ones, which stops the earlier patch from reverse-applying, so a patch
+    # also counts as applied when any later patch in the series is applied.
     sub = Path("3rdparty/llama.cpp")
-    for patch in sorted(Path("patches/llama.cpp").glob("*.patch")):
-        patch = patch.resolve()
-        base = ["git", "-C", str(sub), "apply"]
-        if subprocess.run(base + ["--reverse", "--check", str(patch)], capture_output=True).returncode == 0:
+    base = ["git", "-C", str(sub), "apply"]
+    patches = [p.resolve() for p in sorted(Path("patches/llama.cpp").glob("*.patch"))]
+
+    def check(args, patch):
+        return subprocess.run(base + args + ["--check", str(patch)], capture_output=True).returncode == 0
+
+    for i, patch in enumerate(patches):
+        if check(["--reverse"], patch):
             logging.info(f"Patch {patch.name} already applied.")
-        elif subprocess.run(base + ["--check", str(patch)], capture_output=True).returncode == 0:
+        elif check([], patch):
             run_command(base + [str(patch)], log_step=f"apply_patch_{patch.stem}")
             logging.info(f"Applied patch {patch.name}.")
+        elif any(check(["--reverse"], later) for later in patches[i + 1:]):
+            logging.info(f"Patch {patch.name} already applied (superseded by a later patch).")
         else:
             logging.error(f"Patch {patch.name} does not apply to {sub}; check the submodule revision.")
             sys.exit(1)
