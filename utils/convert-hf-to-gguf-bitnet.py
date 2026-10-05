@@ -250,11 +250,11 @@ class Model(ABC):
         if self.is_safetensors:
             if self.num_parts == 1:  # there's only one .safetensors file
                 return ("model.safetensors",)
-            return (f"model-{n:05}-of-{self.num_parts:05}.safetensors" for n in range(1, self.num_parts + 1))
+            return tuple(f"model-{n:05}-of-{self.num_parts:05}.safetensors" for n in range(1, self.num_parts + 1))
 
         if self.num_parts == 1:  # there's only one .bin file
             return ("pytorch_model.bin",)
-        return (f"pytorch_model-{n:05}-of-{self.num_parts:05}.bin" for n in range(1, self.num_parts + 1))
+        return tuple(f"pytorch_model-{n:05}-of-{self.num_parts:05}.bin" for n in range(1, self.num_parts + 1))
 
     # used for GPT-2 BPE and WordPiece vocabs
     def get_vocab_base(self) -> tuple[list[str], list[int], str]:
