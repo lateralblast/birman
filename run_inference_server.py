@@ -13,6 +13,8 @@ def run_command(command, shell=False):
         print(f"Error occurred while running command: {e}")
         sys.exit(1)
 
+BITNET_2B_CHAT_TEMPLATE = os.path.join("chat-templates", "bitnet-b1.58-2B-4T.jinja")
+
 def run_server():
     build_dir = "build"
     if platform.system() == "Windows":
@@ -37,6 +39,16 @@ def run_server():
     
     if args.prompt:
         command.extend(['-p', args.prompt])
+
+    template = args.chat_template_file
+    if template is None and "2B-4T" in args.model:
+        # The GGUF's embedded template ends the prompt with an EOS token, so
+        # /v1/chat/completions returns text unrelated to the question.
+        # Clients should also send "stop": ["Human:"], as the model does not
+        # reliably emit EOS at the end of a turn.
+        template = BITNET_2B_CHAT_TEMPLATE
+    if template:
+        command.extend(['--chat-template-file', template])
     
     # Note: -cnv flag is removed as it's not supported by the server
     
@@ -59,6 +71,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, help="Temperature for sampling", required=False, default=0.8)
     parser.add_argument("--host", type=str, help="IP address to listen on", required=False, default="127.0.0.1")
     parser.add_argument("--port", type=int, help="Port to listen on", required=False, default=8080)
+    parser.add_argument("--chat-template-file", type=str, help="Jinja chat template for /v1/chat/completions (default: built in for BitNet-b1.58-2B-4T, otherwise the model's own)", required=False, default=None)
     
     args = parser.parse_args()
     run_server()
