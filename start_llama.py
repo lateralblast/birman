@@ -223,6 +223,9 @@ def choose_model(args, m, threads):
         print("  no models found under %s (run ./build.sh, or pass -m MODEL.gguf)" % args.models_dir, file=sys.stderr)
         return None, set()
     mem = int(m["mem_avail_gb"] * 1073741824)
+    if mem <= 0:  # not readable on this OS (no /proc/meminfo): do not conclude that nothing fits
+        print("  available memory could not be read on this system: memory fit is not checked", file=sys.stderr)
+        mem = 1 << 62
     bench = os.path.join(args.bin_dir, TOOLS["bench"])
     numa_extra, _reason = numa.explain([], not args.no_numa)
     evicted = set()
@@ -243,9 +246,10 @@ def choose_model(args, m, threads):
             return picker.probe_tps(bench, c["path"], threads, numa_extra, key, use_cache=not args.reprobe, before=before)
 
     chosen, rows = picker.select(cands, mem, args.prefer, args.min_tps, probe)
-    print("Model selection (%s; at least %.0f t/s measured; needs 1.2x the file + 0.5 GiB of the %.1f GiB available):"
+    mem_text = "%.1f GiB available" % (mem / 1073741824.0) if mem < (1 << 61) else "memory unknown"
+    print("Model selection (%s; at least %.0f t/s measured; needs 1.2x the file + 0.5 GiB, %s):"
           % ("chat-capable models first, then more parameters" if args.prefer == "chat" else "most parameters first",
-             args.min_tps, mem / 1073741824.0), file=sys.stderr)
+             args.min_tps, mem_text), file=sys.stderr)
     for c, status in rows:
         print("  %-30s %5.2f B  %5.2f GiB  %-5s %s%s" % (c["label"][:30], c["params"] / 1e9, c["size"] / 1073741824.0, "chat" if c["chat"] else "",
                                                       status, "   <-- chosen" if chosen and c["path"] == chosen["path"] else ""), file=sys.stderr)

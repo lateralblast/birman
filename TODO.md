@@ -16,6 +16,26 @@ described in the notice at the top of `README.md`.
   of 128 instead of silently skipping the tail. Delete them or give them tail support if something starts using them.
 - [ ] Row lengths for I2_S must be a multiple of 4 (asserted in `quantize_i2_s`).
 
+## ARM / Apple Silicon: first steps
+
+Nothing has run on real ARM yet (see `README.md`, Known issues). The compiled I2_S kernels on aarch64 are the scalar
+fallback only; `ggml-aarch64.c` and `ggml-bitnet-compute.c` in the submodule are never built. `CLAUDE.md` (gitignored,
+copy it by hand) has the full handoff; the essentials:
+
+- [ ] `./build.sh`, then the kernel unit test (`utils/test_i2s_kernels.c`, must print `ALL OK`), then a 2B-4T generation
+  (`The capital of France is Paris. Paris is a city that is known for its rich history, culture,`) and
+  `python utils/test_server_api.py` (18/18).
+- [ ] I2_S against f32 perplexity on `bitnet_b1_58-large` (WikiText-2 100 k slice; reference 12.9532 against 12.9638 on
+  8 chunks, 11.8181 on the whole slice), then speed with `llama-bench` and the performance-core count as `-t`.
+- [ ] A NEON `ggml_vec_dot_i2_i8_s` and `ggml_gemm_i2_i8_s` (new patch `0009`), following the layout, the
+  `sum(code*y)` convention and the row tail in `ggml_i2s_tail_dot`; verify with the unit test, then perplexity.
+- [ ] macOS portability: `start_llama.py` reads `/proc` and `/sys` (thread default would count efficiency cores; use
+  `sysctl hw.perflevel0.physicalcpu`, `hw.memsize`, `vm_stat`), `build.sh` assumes bash 4+, `utils/test_gemm_kernel.sh`
+  looks for `libggml.so` and uses `-march=native`, `utils/test_power.sh` is Intel/Linux only, and
+  `utils/cleanup_stale_models.sh` uses GNU `stat`/`numfmt`.
+- [ ] TL1: `setup_env.py` runs `codegen_tl1.py` on arm64 but always passes `-DBITNET_ARM_TL1=OFF`, so TL1 is never
+  compiled in; untested.
+
 ## NUMA
 
 - [ ] `--numa distribute` is only verified on one 2-socket, 2-node Xeon (E5-2682 v4). Machines with more NUMA nodes
