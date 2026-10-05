@@ -1,3 +1,5 @@
+![birman](birman.jpg)
+
 > [!NOTE]
 > **This is a fork of [microsoft/BitNet](https://github.com/microsoft/BitNet)** (`birman`), kept to build and run on current Python and NumPy 2.x. Everything below this notice is the upstream README, unchanged.
 >
