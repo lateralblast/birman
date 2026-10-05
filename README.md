@@ -10,7 +10,7 @@
 > - `patches/llama.cpp/0003-llama-quantize-i2_s.patch` (upstream commit `cea12e83f`) registers `I2_S` in `llama-quantize`, and `0004-i2_s-quantize-block-layout.patch` makes the I2_S quantizer write the layout the kernels and `dequantize_row_i2_s` read (128-element blocks packed into 32 bytes). `0005-i2_s-quantize-row-length-assert.patch` makes `quantize_i2_s` abort on a row length that is not a multiple of 128 instead of quietly writing garbage, and `0006-i2s-row-tail-support.patch` then adds support for such rows: the last `n % 128` elements of each row are stored after the 128-element blocks (4 per byte, in order) and added by a scalar helper in `vec_dot`, `gemm` and llamafile's `tinyBLAS_I2S_AVX` (AVX2 only). Rows that are a multiple of 128 keep the old layout, so existing GGUFs still work. Before `0004` it packed sequentially, so any model quantized locally produced garbage. `utils/convert-ms-to-gguf-bitnet.py` now targets `MODEL_ARCH.BITNET_B158`; the old `BITNET_25` has no name in the fork's `gguf-py` and no C++ implementation.
 > - `patches/llama.cpp/0001-bitnet-b158-squared-relu-ffn.patch` fixes the `bitnet-b1.58` graph, which reused the 3B model's SiLU FFN. `BitNet-b1.58-2B-4T` needs squared ReLU, which was the cause of its bad output. The patch applies it only to the 30-layer 2B-4T model (`LLM_TYPE_2B`); the 1bitLLM models share the arch but use SiLU and stay on it (an earlier, broader version of this patch broke `bitnet_b1_58-large`).
 > - The submodule is a fork we can't push to, so fixes are kept as patches and applied idempotently by `setup_env.py` (`apply_patches()`).
-> - `setup_env.py` keeps the token embedding at f16 by default (`--no-quant-embd` to disable). Quantizing it to I2_S, as `llama-quantize` does otherwise, produced garbage for `Llama3-8B-1.58-100B-tokens`, whose embedding is untied and not ternary.
+> - `setup_env.py` keeps the token embedding at f16 by default (`--no-quant-embd` to disable). Without it, `llama-quantize` quantizes the token embedding of models with untied embeddings (`tie_word_embeddings: false`: Llama3-8B, Falcon3) to I2_S, although an embedding is not ternary: that produced garbage for `Llama3-8B-1.58-100B-tokens` and costs about 7% perplexity on Falcon3-1B. For models with tied embeddings (bitnet_b1_58-large/3B, 2B-4T) the embedding is also the output projection and the default was Q6_K, which is just as accurate as f16 (perplexity 11.8166 against 11.8181 on bitnet_b1_58-large), so there the new default only costs about 55 MB.
 > - `build.sh` runs the whole sequence: submodule init, patches, venv and requirements, model download, `setup_env.py`.
 > - `run_inference.py` uses `llama-completion` for plain prompts (current `llama-cli` is chat-only), maps `-p` to the system prompt in `-cnv` mode, and uses `chat-templates/bitnet-b1.58-2B-4T.jinja` for the 2B-4T model. The GGUF's embedded template ends the prompt with an EOS token, which made chat answers unrelated to the question.
 > - `CLAUDE.md` documents the above for Claude Code.
@@ -21,7 +21,7 @@
 > - `test_gemm_kernel.sh` (`utils/test_gemm_kernel.sh -i 100 -o results.csv`) now finds the libraries itself: `$GGML_LIB_DIR` if set, else `build/bin`, else the older `build/3rdparty/llama.cpp/ggml/src`. It links `libggml-cpu` and `libggml-base` when present, since the I2_S kernels live in `libggml-cpu` in current llama.cpp (before, the link failed with `undefined reference to ggml_vec_dot_i2_i8_s`). The benchmark now calls the library's `ggml_gemm_i2_i8_s`; before, it timed its own copy of the loop, which is slower than the tiled kernel llama.cpp runs (about 190-207 GFLOPS against about 168 on an i9-9900, 8 threads). Throughput and latency per token now count activation rows (`nr`), not weight rows; the old single-token figure was about 29.6 million tokens/s. The `Std dev` and the `±` in the CSV are now measured over the iterations; they were `sqrt((max-min)^2/12)` in the binary and `(max-min)/4` in the CSV. It still checks no output, and every case uses `n` of 2048 or 8192, so the tail path from patch `0006` is not benchmarked (pass another `-n` to the binary to try it).
 > - `test_power.sh` (`utils/test_power.sh <model.gguf> <out.csv> "<pp threads>" "<tg threads>"`, from the repo root) measures power with Intel RAPL (`/sys/class/powercap`: package energy over the run divided by its duration, plus DRAM when the CPU has a dram zone), else turbostat (average `PkgWatt`/`RAMWatt`), else the old CPU usage x 200 W estimate, which is only a guess and is flagged as such. Both RAPL and turbostat normally need root; when not root the script uses `sudo -n` for those reads if passwordless sudo works. `POWER_SOURCE=auto|rapl|turbostat|estimate` forces a source and `POWER_NO_SUDO=1` disables sudo. The CSV gained trailing `PowerSource` and `DRAM(W)` columns; `Power(W)` and `Energy(J/t)` are package power only. On the i9-9900 RAPL and turbostat agreed within about 2 W (about 70 W package for `bitnet_b1_58-large`), while the old estimate gave 82-102 W. The measurement covers the whole `llama-bench` process, including model load, and everything else running on the machine, so use an idle system. RAPL is Intel-only; turbostat on AMD is untested.
 > - `e2e_benchmark.py` used to exit with status 1 even when the benchmark succeeded: the `sys.exit(1)` in `run_command` was dedented out of its `except` block. It now exits 0 on success and 1 on failure.
-> - `test_perplexity.py` is unchanged. It needs `data/<dataset>/test.txt` folders (`--data-dir`), which are not in the repo; it was only run against two small made-up datasets to check that it works, and `--test-embeddings` was not run.
+> - `test_perplexity.py` is unchanged and works. It needs `data/<dataset>/test.txt` folders (`--data-dir`), which are not in the repo; the results below use the WikiText-2 test set from `Salesforce/wikitext` on Hugging Face. For `--test-embeddings`, `-m` must be an f32 GGUF: it re-quantizes it to I2_S once per embedding type and deletes the files it created.
 >
 > **Benchmarks (2026-10-05, one machine, CPU only)**
 >
@@ -37,7 +37,7 @@
 > | bitnet_b1_58-3B | 3.32 B | 965 MiB | 93.7 +/- 1.4 | 25.9 +/- 0.0 |
 > | Llama3-8B-1.58-100B-tokens | 8.03 B | 3.01 GiB | 61.1 +/- 1.2 | 12.3 +/- 0.1 |
 >
-> (1) That file was quantized before f16 embeddings became the default, so its embedding is I2_S; its speed is meaningful but its output quality was only checked loosely.
+> (1) That file was quantized before f16 embeddings became the default, so its embedding is I2_S (see the accuracy table: about 7% worse perplexity than with f16).
 >
 > **The repo's own `utils/e2e_benchmark.py -n 128 -p 128 -t 8`** forces a batch size of 1 (`-b 1`), so its prompt numbers are about as slow as generation and are not comparable to the table above: bitnet_b1_58-large 88.5 / 90.7 t/s (pp128 / tg128), Falcon3-1B 53.8 / 52.0, BitNet-2B-4T 23.1 / 22.5, bitnet_b1_58-3B 23.1 / 25.8, Llama3-8B 12.4 / 11.1.
 >
@@ -54,10 +54,38 @@
 >
 > **Power, `utils/test_power.sh`, BitNet-2B-4T, 8 threads, Intel RAPL:** prompt processing 202.6 t/s at 61.9 W package (3.3 W DRAM), 0.31 J/token; generation 23.1 t/s at 64.4 W package (6.1 W DRAM), 2.79 J/token. Package power only, whole `llama-bench` process including model load, nothing else running.
 >
+> **Accuracy (2026-10-05)**
+>
+> **Perplexity, `utils/test_perplexity.py -d <data> -t 8 -c 512`** on the first 100 k characters of the WikiText-2 test set (about 25 k tokens, 48 chunks; +/- is the standard error). Perplexities are only comparable between files of the same model, because the tokenizers differ:
+>
+> | Model | Perplexity |
+> |---|---:|
+> | bitnet_b1_58-large | 11.82 +/- 0.27 |
+> | bitnet_b1_58-3B | 8.84 +/- 0.19 |
+> | BitNet-b1.58-2B-4T | 16.65 +/- 0.44 |
+> | Llama3-8B-1.58-100B-tokens | 10.67 +/- 0.25 |
+> | Falcon3-1B-Instruct-1.58bit, embedding f16 | 15.36 +/- 0.40 |
+> | Falcon3-1B-Instruct-1.58bit, embedding I2_S (old file) | 16.44 +/- 0.43 |
+>
+> **I2_S against the f32 GGUF it came from**, `llama-perplexity -c 512` on identical leading chunks (the f32 files are the converter's output, so this measures quantization loss only):
+>
+> | Model | Chunks | f32 | I2_S | Difference |
+> |---|---:|---:|---:|---:|
+> | bitnet_b1_58-large | 8 | 12.964 | 12.953 | -0.1% |
+> | bitnet_b1_58-3B | 8 | 9.938 | 9.956 | +0.2% |
+> | Falcon3-1B (f16 embedding) | 8 | 15.997 | 16.038 | +0.3% |
+> | Llama3-8B | 3 | 11.336 | 11.458 | +1.1% |
+>
+> All differences are well inside the standard errors (0.8-1.1 perplexity points on 3-8 chunks), so I2_S loses nothing measurable; the Llama3-8B wrong answer to "The capital of France is" is the model, not the quantization. With a tail-handling bug (before patch `0006`) bitnet_b1_58-3B scored about 7,400 on the same kind of test, so the check can see a broken kernel.
+>
+> **Token embedding type, `test_perplexity.py --test-embeddings`** (bitnet_b1_58-large, I2_S weights, WikiText-2 100 k): f32 11.818, f16 11.818, q8_0 11.808, q6_k 11.817, q5_0 11.838, q4_0 11.892, q3_k 12.033, **tq2_0 108.2**. Down to q6_k there is no measurable loss; below q4_0 it gets worse, and a ternary embedding is unusable.
+>
+> **Embedding models** (`llama-embedding`, `query: ` prefix, normalized): for both the 270M (640 dimensions) and the 0.6B (1024 dimensions) model, similar pairs (cat/kitten, Hund/dog, a password paraphrase) score 0.82-0.96 and unrelated pairs 0.62-0.75, so the order is right (270M: lowest similar 0.824 against highest unrelated 0.710; 0.6B: 0.886 against 0.749). That is a sanity check, not MTEB; the guide's MTEB table was not reproduced.
+>
 > **Verified:** Python 3.14.6, NumPy 2.5.3, clang 21, x86_64 Linux, I2_S kernel, with `microsoft/BitNet-b1.58-2B-4T-gguf`; `1bitLLM/bitnet_b1_58-large` through the full `python setup_env.py --hf-repo 1bitLLM/bitnet_b1_58-large -q i2_s` route (download, convert, quantize, run: correct output); and `microsoft/bitnet-embedding-0.6b` (embeddings sensible: cat/kitten 0.70, Hund/dog 0.77 across languages, unrelated pairs ~0.3). For 2B-4T: correct completion and multi-turn chat output at about 20 t/s on 8 threads, via `run_inference.py` and via `run_inference_server.py` (`/completion`, `/v1/chat/completions` including system message, multi-turn and streaming). `HF1BitLLM/Llama3-8B-1.58-100B-tokens` through `setup_env.py` (about 36 GB peak memory in the f32 conversion, so it needs swap on a 64 GB machine) with the embedding at f16: coherent, correct answers ("Water boils at a temperature of 100 degrees Celsius"; greedy decoding gave a wrong but fluent answer for "The capital of France is"). `1bitLLM/bitnet_b1_58-3B`: the f32 GGUF answers correctly; all-I2_S (966 MB) matches it ("Paris. It is the largest city in France"; perplexity 25.61 against 25.60 for a variant with `ffn_down` at Q8_0). Its `ffn_down` rows are 8640 long, which is not a multiple of 128; before patch `0006` the I2_S kernel dropped the last 64 elements of every row and the model was garbage (perplexity about 7400). Unit tests of `vec_dot`, `gemv`, `gemm`, llamafile sgemm and the dequantizer against a scalar reference pass for row lengths 64 to 8640, including tails that are not a multiple of 32.
 >
 > **Remaining issues**
-> - Only the cases above were tested. Not tested: ARM, Windows/macOS, TL1/TL2 kernels, the Falcon3 models beyond a plausible but weak 1B completion, the 270M embedding model, accuracy measured by perplexity or MTEB, and `utils/test_perplexity.py` against real datasets (the other two `utils/test_*` scripts were run, see above).
+> - Only the cases above were tested. Not tested: ARM, Windows/macOS, TL1/TL2 kernels, MTEB or any downstream task (only perplexity and embedding similarity checks were run, see Accuracy), and perplexity on the full WikiText-2 test set (a 100 k-character slice was used).
 > - The GGUF's embedded chat template (`Human: … BITNETAssistant:`) is not the one the model was trained with, and its trailing EOS makes chat answers unrelated to the question. `chat-templates/bitnet-b1.58-2B-4T.jinja` is the template from the model's own `tokenizer_config.json` (`User: …<|eot_id|>Assistant: `), which `run_inference.py` and `run_inference_server.py` use for the 2B-4T model. With it the model ends turns cleanly, with no reverse prompt or `stop` strings. Other models still use their own embedded templates. In `run_inference_server.py`, `-p` is passed to `llama-server` as `-p` (upstream behaviour) and is not a system prompt; send system messages in the request.
 > - HF checkpoint to I2_S conversion was tested via the README's safetensors route (`utils/convert-helper-bitnet.py` on `microsoft/bitnet-b1.58-2B-4T-bf16`: correct text, 95-99% of packed weight bytes match the official GGUF, the rest are ternary rounding differences) and via `setup_env.py --hf-repo` (`bitnet_b1_58-large`). The helper does not quantize the embedding to F16 as the official GGUF does (it stays Q6_K). The embedding models ship a prebuilt I2_S GGUF and convert in Python, so they don't use `llama-quantize`. The ARM kernels use a different `QK_I2_S` (64); the new packing assumes 128, as `dequantize_row_i2_s` does, and is untested on ARM.
 > - `Falcon-E-1B-Instruct` converts but does not load: the fork has no `falcon_e` pre-tokenizer.
@@ -67,6 +95,11 @@
 > - The `gguf` Python package from PyPI lacks the BitNet enums. `setup_env.py` (and so `build.sh`) installs the fork's `3rdparty/llama.cpp/gguf-py` into the venv, which fixes this; running the `utils/convert-*` scripts any other way needs `PYTHONPATH=3rdparty/llama.cpp/gguf-py`.
 > - The `patches/` directory is a workaround; the real fix belongs in the llama.cpp fork the submodule points at.
 > - `setup_env.py` rewrites the tracked file `include/bitnet-lut-kernels.h` on every run.
+>
+> **Build Requirements**
+> - cmake
+> - clang
+> - python3.14-venv
 
 <div align="center">
 
