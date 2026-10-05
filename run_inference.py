@@ -39,11 +39,10 @@ def run_inference():
         command += ['-sys', args.prompt, '-cnv']
         template = args.chat_template_file
         if template is None and "2B-4T" in args.model:
-            # The GGUF's embedded template ends the prompt with an EOS token, so the model
-            # answers with unrelated text. Use a template without it, and stop on "Human:"
-            # because the model does not reliably emit EOS at the end of a turn.
+            # The GGUF embeds a legacy "Human: ... BITNETAssistant:" template whose trailing
+            # EOS makes the model start a new document. Use the model's real template
+            # ("User: ...<|eot_id|>Assistant: "), after which it ends turns with EOG tokens.
             template = BITNET_2B_CHAT_TEMPLATE
-            command += ['-r', 'Human:']
         if template:
             command += ['--chat-template-file', template]
     else:

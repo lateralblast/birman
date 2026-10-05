@@ -1,7 +1,8 @@
+{#- Chat template from microsoft/bitnet-b1.58-2B-4T-bf16 (tokenizer_config.json), plus BOS.
+    The GGUF's embedded "Human: ... BITNETAssistant:" template is not the one the model was
+    trained with, and its trailing EOS makes the model start a new document. -#}
 {%- for message in messages -%}
 {%- if loop.first -%}{{ bos_token }}{%- endif -%}
-{%- if message['role'] == 'system' -%}{{ message['content'] + '\n\n' }}
-{%- elif message['role'] == 'user' -%}{{ 'Human: ' + message['content'] + '\n\nBITNETAssistant: ' }}
-{%- elif message['role'] == 'assistant' -%}{{ message['content'] + eos_token }}
-{%- endif -%}
+{{- message['role'] | capitalize + ': ' + message['content'] | trim + '<|eot_id|>' -}}
 {%- endfor -%}
+{%- if add_generation_prompt -%}{{ 'Assistant: ' }}{%- endif -%}

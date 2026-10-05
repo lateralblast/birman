@@ -42,10 +42,9 @@ def run_server():
 
     template = args.chat_template_file
     if template is None and "2B-4T" in args.model:
-        # The GGUF's embedded template ends the prompt with an EOS token, so
-        # /v1/chat/completions returns text unrelated to the question.
-        # Clients should also send "stop": ["Human:"], as the model does not
-        # reliably emit EOS at the end of a turn.
+        # The GGUF embeds a legacy "Human: ... BITNETAssistant:" template whose trailing
+        # EOS makes /v1/chat/completions return text unrelated to the question. Use the
+        # model's real template ("User: ...<|eot_id|>Assistant: ").
         template = BITNET_2B_CHAT_TEMPLATE
     if template:
         command.extend(['--chat-template-file', template])
