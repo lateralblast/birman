@@ -376,7 +376,7 @@ int main(int argc, char** argv) {
 EOF
     
     # Compiler flags
-    CXXFLAGS="-O3 -march=native -mtune=native -std=c++17 -fopenmp"
+    CXXFLAGS="-O3 -march=native -mtune=native -std=c++17"  # no -fopenmp: the benchmark is single-threaded and clang may lack libomp
     CXXFLAGS+=" -I${SCRIPT_DIR}/.. -I${SCRIPT_DIR}/../include"
     CXXFLAGS+=" -I${SCRIPT_DIR}/../3rdparty/llama.cpp/ggml/include"
     CXXFLAGS+=" -I${SCRIPT_DIR}/../3rdparty/llama.cpp/ggml/src"

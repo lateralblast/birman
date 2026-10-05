@@ -19,6 +19,7 @@
 >
 > **Test scripts (`utils/`)**
 > - `test_gemm_kernel.sh` (`utils/test_gemm_kernel.sh -i 100 -o results.csv`) now finds the libraries itself: `$GGML_LIB_DIR` if set, else `build/bin`, else the older `build/3rdparty/llama.cpp/ggml/src`. It links `libggml-cpu` and `libggml-base` when present, since the I2_S kernels live in `libggml-cpu` in current llama.cpp (before, the link failed with `undefined reference to ggml_vec_dot_i2_i8_s`). The benchmark now calls the library's `ggml_gemm_i2_i8_s`; before, it timed its own copy of the loop, which is slower than the tiled kernel llama.cpp runs (about 190-207 GFLOPS against about 168 on an i9-9900, 8 threads). Throughput and latency per token now count activation rows (`nr`), not weight rows; the old single-token figure was about 29.6 million tokens/s. The `Std dev` and the `±` in the CSV are now measured over the iterations; they were `sqrt((max-min)^2/12)` in the binary and `(max-min)/4` in the CSV. It still checks no output, and every case uses `n` of 2048 or 8192, so the tail path from patch `0006` is not benchmarked (pass another `-n` to the binary to try it).
+> - `test_gemm_kernel.sh` no longer passes `-fopenmp` (the benchmark is single-threaded and uses no OpenMP, and the flag broke the link with clang when `libomp` is not installed); `CXX=clang++` works on machines without `g++`.
 > - `test_power.sh` (`utils/test_power.sh <model.gguf> <out.csv> "<pp threads>" "<tg threads>"`, from the repo root) measures power with Intel RAPL (`/sys/class/powercap`: package energy over the run divided by its duration, plus DRAM when the CPU has a dram zone), else turbostat (average `PkgWatt`/`RAMWatt`), else the old CPU usage x 200 W estimate, which is only a guess and is flagged as such. Both RAPL and turbostat normally need root; when not root the script uses `sudo -n` for those reads if passwordless sudo works. `POWER_SOURCE=auto|rapl|turbostat|estimate` forces a source and `POWER_NO_SUDO=1` disables sudo. The CSV gained trailing `PowerSource` and `DRAM(W)` columns; `Power(W)` and `Energy(J/t)` are package power only. On the i9-9900 RAPL and turbostat agreed within about 2 W (about 70 W package for `bitnet_b1_58-large`), while the old estimate gave 82-102 W. The measurement covers the whole `llama-bench` process, including model load, and everything else running on the machine, so use an idle system. RAPL is Intel-only; turbostat on AMD is untested.
 > - `e2e_benchmark.py` used to exit with status 1 even when the benchmark succeeded: the `sys.exit(1)` in `run_command` was dedented out of its `except` block. It now exits 0 on success and 1 on failure.
 > - `test_i2s_kernels.c` (new; build line in its header) checks `quantize_i2_s`, `dequantize_row_i2_s`, `vec_dot`, `gemv`, `gemm` and llamafile's sgemm against a scalar reference at row lengths from 64 to 8640, including row tails; run it after any change to the I2_S kernels, on an AVX2 build and on one built without AVX2.
@@ -54,6 +55,54 @@
 > **GEMM kernel, `utils/test_gemm_kernel.sh -i 500`** (the library's `ggml_gemm_i2_i8_s`, n = 2048 unless noted): a single token takes 0.055 ms (153 GFLOPS); batches of 128 / 256 / 512 tokens take 7.2 / 11.1 / 22.6 ms (149 / 194 / 190 GFLOPS); the 8192-wide FFN cases take 21.2 ms (up, 203 GFLOPS) and 23.1 ms (down, 186 GFLOPS); 2048 tokens take 94.4 ms (182 GFLOPS); 32 tokens take 1.30 ms (207 GFLOPS). The 128-token case was 5.2-6.4 ms in earlier runs, so the small cases vary by 20% or so from run to run.
 >
 > **Power, `utils/test_power.sh`, BitNet-2B-4T, 8 threads, Intel RAPL:** prompt processing 202.6 t/s at 61.9 W package (3.3 W DRAM), 0.31 J/token; generation 23.1 t/s at 64.4 W package (6.1 W DRAM), 2.79 J/token. Package power only, whole `llama-bench` process including model load, nothing else running.
+>
+> **Second machine: 2 x Xeon E5-2682 v4 (2026-10-05)**
+>
+> **System:** 2 sockets x 16 cores x 2 threads = 64 logical CPUs (Broadwell, AVX2 and FMA, no AVX-512 or VNNI), 3.0 GHz max turbo, 40 MB L3 per socket, 2 NUMA nodes. RAM: 16 x 32 GB DDR4-2133 (about 68 GB/s theoretical per socket), 499 GB. Ubuntu, clang 21.1.8, same llama.cpp submodule (`390c30775`), `birman` at `b26e995` plus the `build.sh` and `test_gemm_kernel.sh` fixes below. Idle machine (load 0.1), turbo on, governor `schedutil`. Same methods as above: `llama-bench` mean +/- standard deviation over 3 repeats, CPU only, I2_S weights. The models were copied from the i9-9900 machine (sizes and checksums verified) and the 2B-4T GGUF downloaded by `build.sh`.
+>
+> **Speed at 8 threads, `llama-bench -p 512 -n 128 -t 8 -r 3`** (same settings as the i9 table; Falcon-E-1B was not run on the i9):
+>
+> | Model | Xeon pp512 (t/s) | Xeon tg128 (t/s) | i9-9900 pp512 | i9-9900 tg128 |
+> |---|---:|---:|---:|---:|
+> | bitnet_b1_58-large | 330.8 +/- 4.0 | 85.0 +/- 2.9 | 393.9 | 83.6 |
+> | Falcon3-1B (I2_S embedding) | 198.4 +/- 15.6 | 53.5 +/- 2.2 | 307.8 | 53.7 |
+> | Falcon-E-1B-Instruct | 149.2 +/- 0.4 | 54.5 +/- 2.5 | - | - |
+> | BitNet-b1.58-2B-4T | 131.3 +/- 0.5 | 23.4 +/- 0.2 | 188.7 | 23.4 |
+> | bitnet_b1_58-3B | 66.2 +/- 0.2 | 23.7 +/- 0.9 | 93.7 | 25.9 |
+> | Llama3-8B-1.58-100B-tokens | 49.1 +/- 0.0 | 12.9 +/- 0.3 | 61.1 | 12.3 |
+>
+> At 8 threads generation is within about 10% on both machines (it is limited by memory bandwidth), while prompt processing is 16-36% slower on the Xeon (lower clock and IPC). The repo's `e2e_benchmark.py -p 128 -n 128 -t 8` (batch size 1) gives 12.9 / 12.8 t/s for Llama3-8B and 22.8 / 23.4 for 2B-4T (pp128 / tg128).
+>
+> **Using the whole machine, `llama-bench -p 128 -n 128 -r 3`**, BitNet-2B-4T (pp128 / tg128, t/s):
+>
+> | Threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+> |---|---:|---:|---:|---:|---:|---:|---:|---:|
+> | unpinned, pp128 | 19.8 | 39.7 | 75.1 | 140.2 | 180.9 | 274.8 | 385.0 | 237.7 (+/- 88) |
+> | unpinned, tg128 | 6.0 | 11.6 | 15.2 | 22.6 | 29.1 | 30.2 | 31.2 | 29.9 |
+>
+> and Llama3-8B:
+>
+> | Threads | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 |
+> |---|---:|---:|---:|---:|---:|---:|---:|---:|
+> | unpinned, pp128 | 6.3 | 12.9 | 24.9 | 48.6 | 85.7 | 96.4 | 139.8 | 159.5 |
+> | unpinned, tg128 | 2.8 | 5.6 | 8.1 | 13.2 | 17.3 | 17.8 | 18.6 | 17.2 |
+>
+> Unpinned, prompt processing scales almost linearly up to 8 threads, then more slowly, and keeps gaining with SMT up to 48-64 threads; generation stops scaling at about 16 threads. NUMA placement matters a lot on this two-socket machine (pp128 / tg128 at the thread count shown):
+>
+> | Placement | 2B-4T | Llama3-8B |
+> |---|---:|---:|
+> | one socket (`numactl --cpunodebind=0 --membind=0`), 16 threads | 254.3 / 22.3 | 98.5 / 12.8 |
+> | unpinned, 32 threads | 274.8 / 30.2 | 96.4 / 17.8 |
+> | interleaved (`numactl --interleave=all`), 32 threads | 397.3 / 32.2 | 180.6 / 18.3 |
+> | interleaved, 64 threads | 475.8 / 31.1 | 162.1 / 18.2 |
+>
+> Interleaving the model's memory across both sockets gives 45% (2B-4T) and 88% (Llama3-8B) more prompt throughput than the default at 32 threads, and a little more generation; one socket on its own is limited to about 12.8 t/s for the 8B (about 41 GB/s of weights). Run on a multi-socket machine as `numactl --interleave=all build/bin/llama-bench ...`. The unpinned numbers are noisy and depend on which node the model file's pages happen to sit in: the same 2B-4T at 32 threads gave 275 pp128 in the sweep and 467 in the power test below (I did not verify why).
+>
+> **GEMM kernel, `utils/test_gemm_kernel.sh -i 500`** (single-threaded, n = 2048 unless noted): 60 GFLOPS for one token (0.14 ms), 81-87 GFLOPS for 128 to 2048 tokens, 101 GFLOPS for the 8192-wide `ffn_down` case, against 150-207 on the i9-9900 (5.0 GHz turbo).
+>
+> **Power, `utils/test_power.sh`, BitNet-2B-4T, Intel RAPL (both packages and both DRAM zones, via `sudo`):** at 8 threads prompt processing 133.4 t/s at 115.7 W (DRAM 47.6 W), 0.87 J/token, and generation 23.8 t/s at 118.9 W (DRAM 62.1 W), 4.99 J/token; at 32 threads 466.8 t/s at 195.0 W (0.42 J/token) and 31.9 t/s at 183.3 W (5.75 J/token). The sockets draw about 115 W with only 8 threads busy, so the extra threads are cheap for prompt processing and a net loss for generation.
+>
+> **Accuracy is identical on both machines.** All seven `test_perplexity.py` results on the WikiText-2 slice (large, Falcon3 with both embeddings, 2B-4T, 3B, Llama3-8B, Falcon-E-1B) and all five I2_S-against-f32 comparisons match the i9-9900 to four decimals, although the Xeon used 32 threads and a different CPU, so the I2_S kernels give the same results across hardware. The embedding-model similarity checks (270M and 0.6B) and `test_i2s_kernels.c` also pass on the Xeon.
 >
 > **Accuracy (2026-10-05)**
 >
