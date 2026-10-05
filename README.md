@@ -84,6 +84,52 @@ Other additions: `TODO.md` (what is left to do) and `CLAUDE.md` (guidance for Cl
 
 CPU only (`-ngl 0`), I2_S weights, f16 token embedding unless noted. Every figure is `llama-bench` mean +/- standard deviation over 3 repeats (5 for `e2e_benchmark.py`), so treat differences of a few percent as noise. All measured on 2026-10-05.
 
+### Comparison across machines
+
+`llama-bench -p 512 -n 128 -r 3`, t/s, the same I2_S GGUF files on every machine (f16 token embedding, except Falcon3-1B, whose file has the older I2_S embedding). "8 threads" is the same setting everywhere; "whole machine" is what `start_llama.py` picks by default (the i9 and the M1 Max: 8 threads, so the same figures; the Xeon: 32 threads with `--numa distribute` after `--numa-evict`). The x86 figures are from the sections below; the patches added since (`0009`-`0011`) do not change any x86 code path. M1 Max: 3 interleaved rounds on an idle machine, `0011`.
+
+| | i9-9900 | 2 x Xeon E5-2682 v4 | 2 x Xeon E5-2682 v4 | Apple M1 Max |
+|---|---|---|---|---|
+| Cores used | 8 (of 8, 5.0 GHz turbo) | 8 (of 32, 3.0 GHz) | 32 + `--numa distribute` | 8 performance (of 8 + 2 efficiency) |
+| I2_S kernels | AVX2 | AVX2 | AVX2 | NEON + DOTPROD (`0010`/`0011`) |
+| Memory (theoretical) | DDR4-2666, 42.7 GB/s | DDR4-2133, 68 GB/s per socket | 136 GB/s both sockets | LPDDR5, 400 GB/s (shared with the GPU) |
+
+**Prompt processing, pp512:**
+
+| Model | i9-9900, 8 t | Xeon, 8 t | Xeon, whole machine | M1 Max, 8 t |
+|---|---:|---:|---:|---:|
+| bitnet_b1_58-large | 393.9 | 330.8 | 945.5 | **1152.0** |
+| Falcon3-1B (I2_S embedding) | 307.8 | 198.4 | 592.1 | **772.1** |
+| Falcon-E-1B-Instruct | 219.9 | 149.2 | 489.9 | **553.8** |
+| BitNet-b1.58-2B-4T | 188.7 | 131.3 | 382.0 | **398.7** |
+| bitnet_b1_58-3B | 93.7 | 66.2 | 238.3 | **270.5** |
+| Llama3-8B-1.58-100B-tokens | 61.1 | 49.1 | **168.0** | 132.9 |
+
+**Generation, tg128:**
+
+| Model | i9-9900, 8 t | Xeon, 8 t | Xeon, whole machine | M1 Max, 8 t |
+|---|---:|---:|---:|---:|
+| bitnet_b1_58-large | 83.6 | 85.0 | 135.5 | **238.7** |
+| Falcon3-1B (I2_S embedding) | 53.7 | 53.5 | 123.2 | **166.9** |
+| Falcon-E-1B-Instruct | 58.0 | 54.5 | 108.7 | **177.3** |
+| BitNet-b1.58-2B-4T | 23.4 | 23.4 | 60.3 | **74.1** |
+| bitnet_b1_58-3B | 25.9 | 23.7 | 57.6 | **79.4** |
+| Llama3-8B-1.58-100B-tokens | 12.3 | 12.9 | 33.3 | **41.7** |
+
+With the same 8 threads the M1 Max is 2.1-2.9x the i9-9900 on prompt processing and 2.9-3.4x on generation, and it beats the whole 32-thread, 2-socket Xeon on everything but Llama3-8B prompt processing (0.79x). Generation follows memory bandwidth: Llama3-8B reads about 3.2 GB of weights per token, so 12.3 t/s on the i9 is about 40 GB/s (near its DDR4 peak), 33.3 t/s on the Xeon about 108 GB/s, and 41.7 t/s on the M1 Max about 135 GB/s. The i9 Falcon-E figures were measured on 2026-10-06 (same command, idle machine); a fresh i9 run of the other models agreed with the figures above within noise, except bitnet_b1_58-large prompt processing (487.6 +/- 41.6 against 393.9).
+
+**Q8_0 token embedding (`-q8emb`, written by `build.sh`)**, tg128 t/s, original file -> `-q8emb`, 8 threads, interleaved in the same run (prompt speed did not change on either machine; the i9 files were made with the i9's own `llama-quantize` and are byte-identical to the M1 Max's, except large, whose local f32 conversion differs in the last bit of some scales):
+
+| Model | Embedding | i9-9900 | M1 Max |
+|---|---|---:|---:|
+| bitnet_b1_58-large | tied (also the output layer) | 90.5 -> 105.3 (+16%) | 237.7 -> 264.0 (+11%) |
+| BitNet-b1.58-2B-4T | tied | 23.6 -> 30.7 (+30%) | 76.0 -> 93.7 (+23%) |
+| bitnet_b1_58-3B | tied | 26.0 -> 28.3 (+9%) | 80.7 -> 86.6 (+7%) |
+| Falcon-E-1B-Instruct | untied (Q6_K output layer) | 58.0 -> 58.8 | no clear change |
+| Llama3-8B-1.58-100B-tokens | untied | 12.4 -> 12.5 | 38.8 -> 39.8 |
+
+The gain is largest where the embedding is a large share of the bytes read per token (2B-4T: 657 MB of 1188), and it is the same on both architectures because generation is memory-bound on both.
+
 ### First machine: Intel Core i9-9900
 
 **CPU:** Intel Core i9-9900 (Coffee Lake, 8 cores / 16 threads, 3.1 GHz base, 5.0 GHz max turbo, AVX2, no AVX-512 or VNNI), 256 KiB L1d, 2 MiB L2, 16 MiB L3. RAM: 4 x 16 GB DDR4-2666 (about 42.7 GB/s theoretical peak). Linux 7.0.0-34, clang 21.1.8, llama.cpp submodule `390c30775` (build 9918), `birman` at `28aff1c`. Turbo on, governor `powersave` (intel_pstate), no thread pinning, machine idle (98% idle, load about 1) and 35 GB of RAM free, although 28 GB of swap was in use from earlier work. No GPU (`-ngl 0`), 8 threads unless stated. The tables below are from an idle machine; a later check, while other work was running, measured BitNet-2B-4T at 17 t/s instead of 23.4 and 16 threads collapsing to 9.8 t/s, so a busy desktop will be slower.
