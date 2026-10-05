@@ -91,6 +91,25 @@ echo "  Skip build: $SKIP_BUILD"
 echo "=========================================="
 echo ""
 
+# Locate the built ggml libraries. GGML_LIB_DIR can be set to override; otherwise try the
+# current CMake layout (build/bin) and then the older one (build/3rdparty/llama.cpp/ggml/src).
+find_ggml_lib_dir() {
+    local dir
+    for dir in "${GGML_LIB_DIR:-}" "${SCRIPT_DIR}/../build/bin" "${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"; do
+        if [ -n "$dir" ] && [ -f "$dir/libggml.so" ]; then
+            (cd "$dir" && pwd)
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! GGML_LIB_DIR="$(find_ggml_lib_dir)"; then
+    echo "❌ Error: Cannot find libggml.so in build/bin or build/3rdparty/llama.cpp/ggml/src"
+    echo "Please build the project first with: cmake --build build (or set GGML_LIB_DIR)"
+    exit 1
+fi
+
 # Build the benchmark binary
 if [ "$SKIP_BUILD" = false ]; then
     echo "Step 1: Building GEMM kernel benchmark..."
@@ -130,47 +149,11 @@ if [ "$SKIP_BUILD" = false ]; then
 // Include necessary headers
 #include "../include/gemm-config.h"
 
-// Function declarations (from ggml-quants.h)
-extern "C" void ggml_vec_dot_i2_i8_s(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
-
-// GEMM kernel definition
-void ggml_gemm_i2_i8_s(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
-#if defined(ACT_PARALLEL)
-    const int64_t row_block = ROW_BLOCK_SIZE;
-    const int64_t col_block = COL_BLOCK_SIZE;
-
-    for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-        int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-        for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-            int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-            const void * vy_r = (const uint8_t *)vy + r0 * n;
-            for (int64_t c = 0; c < cur_c; ++c) {
-                const int64_t col = c0 + c;
-                float * s_col = s + col;
-                const void * vx_col = (const uint8_t *)vx + col * n / 4;
-                ggml_vec_dot_i2_i8_s(n, s_col + r0 * bs, bs, vx_col, n, vy_r, n, cur_r);
-            }
-        }
-    }
-#else
-    const int64_t row_block = ROW_BLOCK_SIZE;
-    const int64_t col_block = COL_BLOCK_SIZE;
-
-    for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
-        int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
-        for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
-            int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
-            const void * vx_c = (const uint8_t *)vx + c0 * n / 4;
-            for (int64_t r = 0; r < cur_r; ++r) {
-                const int64_t row = r0 + r;
-                float * s_row = s + row * bs;
-                const void * vy_row = (const uint8_t *)vy + row * n;
-                ggml_vec_dot_i2_i8_s(n, s_row + c0, bs, vx_c, n, vy_row, n, cur_c);
-            }
-        }
-    }
-#endif
-}
+// The kernel under test is the one in libggml-cpu, i.e. what llama.cpp runs for I2_S mat-muls.
+//   n  : inner dimension (elements per row)
+//   s  : output, s[col * bs + row] with col < nr (activation rows) and row < nc (weight rows)
+//   vx : I2_S weights, nc rows of n/4 bytes     vy : I8 activations, nr rows of n bytes
+extern "C" void ggml_gemm_i2_i8_s(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 
 // Helper function to get current time in nanoseconds
 double get_time_ns() {
@@ -210,7 +193,7 @@ void print_config(const BenchmarkConfig& config) {
     printf("Benchmark Configuration:\n");
     printf("=" "=%.78s\n", "===============================================================================");
     printf("  Embedding dimension (n)    : %d\n", config.n);
-    printf("  Matrix Y rows (nr)         : %d\n", config.nr);
+    printf("  Matrix Y rows (nr)         : %d\n", config.nr);  // activation rows = tokens
     printf("  Matrix X columns (nc)      : %d\n", config.nc);
     printf("  Iterations                 : %d\n", config.iterations);
     printf("  Warmup iterations          : %d\n", config.warmup);
@@ -221,7 +204,7 @@ void print_config(const BenchmarkConfig& config) {
            (config.nr * config.n) / 1024.0);
     printf("  S (f32): %d x %d (%.2f KB)\n", config.nr, config.nc,
            (config.nr * config.nc * sizeof(float)) / 1024.0);
-    printf("\nGEMM Config:\n");
+    printf("\nGEMM Config (only used by the non-AVX2 fallback; the AVX2 kernel tiles itself):\n");
 #if defined(ACT_PARALLEL)
     printf("  ACT_PARALLEL              : ON\n");
 #else
@@ -274,6 +257,7 @@ void run_benchmark(const BenchmarkConfig& config) {
     // Benchmark
     printf("Running %d benchmark iterations...\n", config.iterations);
     double total_time = 0.0;
+    double total_sq = 0.0;
     double min_time = 1e20;
     double max_time = 0.0;
     
@@ -284,6 +268,7 @@ void run_benchmark(const BenchmarkConfig& config) {
         
         double elapsed = end - start;
         total_time += elapsed;
+        total_sq += elapsed * elapsed;
         if (elapsed < min_time) min_time = elapsed;
         if (elapsed > max_time) max_time = elapsed;
         
@@ -297,14 +282,16 @@ void run_benchmark(const BenchmarkConfig& config) {
     double avg_time_ms = avg_time_ns / 1e6;
     double min_time_ms = min_time / 1e6;
     double max_time_ms = max_time / 1e6;
+    double var_ns = total_sq / config.iterations - avg_time_ns * avg_time_ns;
+    double std_time_ms = sqrt(var_ns > 0 ? var_ns : 0) / 1e6;
     
     // Calculate GFLOPS
     // For GEMM: nr x nc x n multiply-adds = 2 * nr * nc * n FLOPs
     double flops = 2.0 * config.nr * config.nc * config.n;
     double gflops = (flops / avg_time_ns);
     
-    // Calculate throughput (tokens/s assuming each column is a token)
-    double throughput = (config.nc * 1e9) / avg_time_ns;
+    // Throughput of this one matrix product, counting each activation row (nr) as a token
+    double throughput = (config.nr * 1e9) / avg_time_ns;
     
     // Print results
     printf("\n");
@@ -314,11 +301,11 @@ void run_benchmark(const BenchmarkConfig& config) {
     printf("  Average time  : %.3f ms\n", avg_time_ms);
     printf("  Min time      : %.3f ms\n", min_time_ms);
     printf("  Max time      : %.3f ms\n", max_time_ms);
-    printf("  Std dev       : %.3f ms\n", sqrt((max_time_ms - min_time_ms) * (max_time_ms - min_time_ms) / 12));
+    printf("  Std dev       : %.3f ms\n", std_time_ms);
     printf("\nPerformance:\n");
     printf("  GFLOPS        : %.2f\n", gflops);
     printf("  Throughput    : %.2f tokens/s\n", throughput);
-    printf("  Latency/token : %.3f us\n", (avg_time_ms * 1000) / config.nc);
+    printf("  Latency/token : %.3f us\n", (avg_time_ms * 1000) / config.nr);
     printf("=" "=%.78s\n", "===============================================================================");
     
     // Cleanup
@@ -399,18 +386,13 @@ EOF
     # Link flags
     LDFLAGS="-lm -lpthread"
     
-    # Link with pre-built libraries
-    GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
-    GGML_SO="${GGML_LIB_DIR}/libggml.so"
-    
-    if [ ! -f "${GGML_SO}" ]; then
-        echo "❌ Error: Cannot find libggml.so at ${GGML_SO}"
-        echo "Please build the project first with: cmake --build build"
-        rm -f "${TEMP_CPP}"
-        exit 1
-    fi
-    
-    LDFLAGS+=" -L${GGML_LIB_DIR} -lggml -Wl,-rpath,${GGML_LIB_DIR}"
+    # Link with pre-built libraries. Newer llama.cpp splits the CPU backend (which holds the
+    # I2_S kernels) into libggml-cpu, so link it and libggml-base whenever they are present.
+    GGML_LIBS="-lggml"
+    for lib in ggml-cpu ggml-base; do
+        [ -f "${GGML_LIB_DIR}/lib${lib}.so" ] && GGML_LIBS+=" -l${lib}"
+    done
+    LDFLAGS+=" -L${GGML_LIB_DIR} ${GGML_LIBS} -Wl,-rpath,${GGML_LIB_DIR}"
     
     # Output binary
     BENCHMARK_BIN="${SCRIPT_DIR}/${BUILD_DIR}/test_gemm_kernel"
@@ -446,7 +428,6 @@ else
 fi
 
 # Set LD_LIBRARY_PATH to include the GGML library directory
-GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
 export LD_LIBRARY_PATH="${GGML_LIB_DIR}:${LD_LIBRARY_PATH}"
 
 echo "Step 2: Running benchmark tests"
@@ -481,9 +462,8 @@ extract_and_save() {
         return
     fi
     
-    # Calculate standard deviation estimate from range
-    # Using awk with proper variable passing
-    local std_time=$(awk -v min="$min_time" -v max="$max_time" 'BEGIN {printf "%.4f", (max - min) / 4}')
+    # Standard deviation measured by the benchmark over its iterations
+    local std_time=$(echo "$output" | grep "Std dev" | awk '{print $4}')
     
     # Format as mean±std
     local time_formatted="${avg_time}±${std_time}"
