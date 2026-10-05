@@ -82,7 +82,19 @@ done
 
 # 4. python environment ------------------------------------------------------
 log "Installing requirements into $VENV"
-[ -d "$VENV" ] || "$PY" -m venv "$VENV"
+# venv-begin
+# An interrupted `python -m venv` leaves a directory without bin/activate, so test for that file, not the
+# directory. Only a directory that is clearly a half-built venv (it has pyvenv.cfg) is removed and rebuilt.
+if [ ! -f "$VENV/bin/activate" ]; then
+  if [ -f "$VENV/pyvenv.cfg" ]; then
+    echo "removing incomplete virtualenv $VENV"
+    rm -rf "$VENV"
+  elif [ -d "$VENV" ] && [ -n "$(ls -A "$VENV" 2>/dev/null)" ]; then
+    die "$VENV exists and is not a virtualenv; remove it or pass another location with -v"
+  fi
+  "$PY" -m venv "$VENV" || die "could not create a virtualenv in $VENV (on Debian/Ubuntu: apt install python3-venv)"
+fi
+# venv-end
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
 pip install -q --upgrade pip
@@ -90,7 +102,8 @@ pip install -q -r requirements.txt
 pip install -q "huggingface_hub[cli]" >/dev/null 2>&1 || true
 
 # 5. model -------------------------------------------------------------------
-if ls "$MODEL_DIR"/ggml-model-*.gguf >/dev/null 2>&1; then
+# compgen -G, not ls: with nullglob (set above) an unmatched `ls dir/*.gguf` becomes a bare `ls` and succeeds
+if compgen -G "$MODEL_DIR/ggml-model-*.gguf" >/dev/null; then
   log "Model already present in $MODEL_DIR"
 elif [ "$SKIP_DOWNLOAD" -eq 1 ]; then
   log "Skipping model download (-s)"
@@ -108,7 +121,7 @@ log "Running setup_env.py (kernel codegen, cmake build)"
 python setup_env.py -md "$MODEL_DIR" -q "$QUANT"
 
 # 7. report ------------------------------------------------------------------
-GGUF=$(ls "$MODEL_DIR"/ggml-model-*.gguf 2>/dev/null | head -1 || true)
+GGUF=$(compgen -G "$MODEL_DIR/ggml-model-*.gguf" | head -1 || true)
 log "Done"
 echo "binaries: $ROOT/build/bin/{llama-cli,llama-completion,llama-server,llama-quantize}"
 if [ -n "$GGUF" ]; then
