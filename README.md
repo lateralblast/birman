@@ -22,6 +22,37 @@
 > - `test_power.sh` (`utils/test_power.sh <model.gguf> <out.csv> "<pp threads>" "<tg threads>"`, from the repo root) measures power with Intel RAPL (`/sys/class/powercap`: package energy over the run divided by its duration, plus DRAM when the CPU has a dram zone), else turbostat (average `PkgWatt`/`RAMWatt`), else the old CPU usage x 200 W estimate, which is only a guess and is flagged as such. Both RAPL and turbostat normally need root; when not root the script uses `sudo -n` for those reads if passwordless sudo works. `POWER_SOURCE=auto|rapl|turbostat|estimate` forces a source and `POWER_NO_SUDO=1` disables sudo. The CSV gained trailing `PowerSource` and `DRAM(W)` columns; `Power(W)` and `Energy(J/t)` are package power only. On the i9-9900 RAPL and turbostat agreed within about 2 W (about 70 W package for `bitnet_b1_58-large`), while the old estimate gave 82-102 W. The measurement covers the whole `llama-bench` process, including model load, and everything else running on the machine, so use an idle system. RAPL is Intel-only; turbostat on AMD is untested.
 > - `test_perplexity.py` is unchanged. It needs `data/<dataset>/test.txt` folders (`--data-dir`), which are not in the repo; it was only run against two small made-up datasets to check that it works, and `--test-embeddings` was not run.
 >
+> **Benchmarks (2026-10-05, one machine, CPU only)**
+>
+> **CPU:** Intel Core i9-9900 (Coffee Lake, 8 cores / 16 threads, 3.1 GHz base, 5.0 GHz max turbo, AVX2, no AVX-512 or VNNI), 256 KiB L1d, 2 MiB L2, 16 MiB L3. RAM: 4 x 16 GB DDR4-2666 (about 42.7 GB/s theoretical peak). Linux 7.0.0-34, clang 21.1.8, llama.cpp submodule `390c30775` (build 9918), `birman` at `28aff1c` plus the uncommitted `build.sh`/patch `0006` fixes. Turbo on, governor `powersave` (intel_pstate), no thread pinning, machine idle (98% idle, load about 1) and 35 GB of RAM free, although 28 GB of swap was in use from earlier work. No GPU (`-ngl 0`), 8 threads unless stated. One run per row: `llama-bench` mean +/- standard deviation over 3 repeats (5 for `e2e_benchmark.py`), so treat differences of a few percent as noise.
+>
+> **Speed, `llama-bench -p 512 -n 128 -t 8 -r 3`** (default batch size; I2_S weights, f16 token embedding unless noted):
+>
+> | Model | Params | File | Prompt pp512 (t/s) | Generation tg128 (t/s) |
+> |---|---:|---:|---:|---:|
+> | bitnet_b1_58-large | 0.73 B | 257 MiB | 393.9 +/- 6.0 | 83.6 +/- 1.3 |
+> | Falcon3-1B-Instruct-1.58bit (1) | 1.67 B | 544 MiB | 307.8 +/- 14.4 | 53.7 +/- 0.1 |
+> | BitNet-b1.58-2B-4T (official GGUF) | 2.41 B | 1.10 GiB | 188.7 +/- 6.6 | 23.4 +/- 0.1 |
+> | bitnet_b1_58-3B | 3.32 B | 965 MiB | 93.7 +/- 1.4 | 25.9 +/- 0.0 |
+> | Llama3-8B-1.58-100B-tokens | 8.03 B | 3.01 GiB | 61.1 +/- 1.2 | 12.3 +/- 0.1 |
+>
+> (1) That file was quantized before f16 embeddings became the default, so its embedding is I2_S; its speed is meaningful but its output quality was only checked loosely.
+>
+> **The repo's own `utils/e2e_benchmark.py -n 128 -p 128 -t 8`** forces a batch size of 1 (`-b 1`), so its prompt numbers are about as slow as generation and are not comparable to the table above: bitnet_b1_58-large 88.5 / 90.7 t/s (pp128 / tg128), Falcon3-1B 53.8 / 52.0, BitNet-2B-4T 23.1 / 22.5, bitnet_b1_58-3B 23.1 / 25.8, Llama3-8B 12.4 / 11.1. (The script also exits with status 1 even when it succeeds: a misplaced `sys.exit(1)` in `run_command`.)
+>
+> **Thread scaling, BitNet-2B-4T, `llama-bench -p 128 -n 128 -r 3`:**
+>
+> | Threads | 1 | 2 | 4 | 8 | 16 |
+> |---|---:|---:|---:|---:|---:|
+> | pp128 (t/s) | 37.2 | 76.9 | 136.3 | 204.7 | 208.9 |
+> | tg128 (t/s) | 10.1 | 16.2 | 21.2 | 23.6 | 20.5 |
+>
+> Prompt processing scales almost linearly to the 8 physical cores and gains nothing from SMT (16 threads); generation stops scaling at about 4 threads and gets slower at 16. Llama3-8B generation moves roughly 3.23 GB of weights per token at 12.3 t/s, about 40 GB/s, which is close to the DDR4-2666 peak, so it looks memory-bandwidth-bound (I did not measure bandwidth separately).
+>
+> **GEMM kernel, `utils/test_gemm_kernel.sh -i 500`** (the library's `ggml_gemm_i2_i8_s`, n = 2048 unless noted): a single token takes 0.055 ms (153 GFLOPS); batches of 128 / 256 / 512 tokens take 7.2 / 11.1 / 22.6 ms (149 / 194 / 190 GFLOPS); the 8192-wide FFN cases take 21.2 ms (up, 203 GFLOPS) and 23.1 ms (down, 186 GFLOPS); 2048 tokens take 94.4 ms (182 GFLOPS); 32 tokens take 1.30 ms (207 GFLOPS). The 128-token case was 5.2-6.4 ms in earlier runs, so the small cases vary by 20% or so from run to run.
+>
+> **Power, `utils/test_power.sh`, BitNet-2B-4T, 8 threads, Intel RAPL:** prompt processing 202.6 t/s at 61.9 W package (3.3 W DRAM), 0.31 J/token; generation 23.1 t/s at 64.4 W package (6.1 W DRAM), 2.79 J/token. Package power only, whole `llama-bench` process including model load, nothing else running.
+>
 > **Verified:** Python 3.14.6, NumPy 2.5.3, clang 21, x86_64 Linux, I2_S kernel, with `microsoft/BitNet-b1.58-2B-4T-gguf`; `1bitLLM/bitnet_b1_58-large` through the full `python setup_env.py --hf-repo 1bitLLM/bitnet_b1_58-large -q i2_s` route (download, convert, quantize, run: correct output); and `microsoft/bitnet-embedding-0.6b` (embeddings sensible: cat/kitten 0.70, Hund/dog 0.77 across languages, unrelated pairs ~0.3). For 2B-4T: correct completion and multi-turn chat output at about 20 t/s on 8 threads, via `run_inference.py` and via `run_inference_server.py` (`/completion`, `/v1/chat/completions` including system message, multi-turn and streaming). `HF1BitLLM/Llama3-8B-1.58-100B-tokens` through `setup_env.py` (about 36 GB peak memory in the f32 conversion, so it needs swap on a 64 GB machine) with the embedding at f16: coherent, correct answers ("Water boils at a temperature of 100 degrees Celsius"; greedy decoding gave a wrong but fluent answer for "The capital of France is"). `1bitLLM/bitnet_b1_58-3B`: the f32 GGUF answers correctly; all-I2_S (966 MB) matches it ("Paris. It is the largest city in France"; perplexity 25.61 against 25.60 for a variant with `ffn_down` at Q8_0). Its `ffn_down` rows are 8640 long, which is not a multiple of 128; before patch `0006` the I2_S kernel dropped the last 64 elements of every row and the model was garbage (perplexity about 7400). Unit tests of `vec_dot`, `gemv`, `gemm`, llamafile sgemm and the dequantizer against a scalar reference pass for row lengths 64 to 8640, including tails that are not a multiple of 32.
 >
 > **Remaining issues**

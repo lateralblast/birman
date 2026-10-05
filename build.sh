@@ -57,14 +57,26 @@ git submodule update --init --recursive
 # 3. patches (must precede pip: patch 0002 relaxes the numpy pin) -------------
 log "Applying patches/llama.cpp"
 shopt -s nullglob
-for p in "$ROOT"/patches/llama.cpp/*.patch; do
+# A later patch may edit lines an earlier one added, which stops the earlier one from
+# reverse-applying, so a patch also counts as applied when any later patch is applied.
+patches=("$ROOT"/patches/llama.cpp/*.patch)
+for i in "${!patches[@]}"; do
+  p=${patches[$i]}
   name=$(basename "$p")
   if git -C "$SUB" apply --reverse --check "$p" 2>/dev/null; then
     echo "already applied: $name"
   elif git -C "$SUB" apply --check "$p" 2>/dev/null; then
     git -C "$SUB" apply "$p" && echo "applied: $name"
   else
-    die "$name does not apply to the submodule at $(git -C "$SUB" rev-parse --short HEAD)"
+    superseded=0
+    for q in "${patches[@]:$((i + 1))}"; do
+      if git -C "$SUB" apply --reverse --check "$q" 2>/dev/null; then superseded=1; break; fi
+    done
+    if [ "$superseded" -eq 1 ]; then
+      echo "already applied (superseded by a later patch): $name"
+    else
+      die "$name does not apply to the submodule at $(git -C "$SUB" rev-parse --short HEAD)"
+    fi
   fi
 done
 

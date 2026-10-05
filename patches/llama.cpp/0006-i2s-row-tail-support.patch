@@ -112,8 +112,8 @@ index d2ea0d729..224b9514e 100644
 +        // the tiles above only cover whole 128-element blocks; add the tail for these 4 rows
 +        if (n % 128 != 0) {
 +            for (int i = 0; i < 4; i++) {
-+                for (int64_t c = 0; c < nr; c++) {
-+                    s[c * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + c * n, n);
++                for (int64_t col = 0; col < nr; col++) {
++                    s[col * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + col * n, n);
 +                }
 +            }
 +        }
