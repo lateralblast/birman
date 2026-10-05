@@ -16,6 +16,20 @@ described in the notice at the top of `README.md`.
   of 128 instead of silently skipping the tail. Delete them or give them tail support if something starts using them.
 - [ ] Row lengths for I2_S must be a multiple of 4 (asserted in `quantize_i2_s`).
 
+## NUMA
+
+- [ ] `--numa distribute` is only verified on one 2-socket, 2-node Xeon (E5-2682 v4). Machines with more NUMA nodes
+  (for example AMD EPYC, which can expose 4-8 nodes), and ARM servers, are untested. The default applies whenever
+  Linux reports more than one node with CPUs (`numa_distribute.py`), so check it there before relying on it.
+- [ ] The gain depends on the pinned threads first-touching the model's pages. After a copy or download the pages
+  sit on one node and a run gains only about 10-15%; today the user has to evict the file (`--numa-evict`) once.
+  Detecting a misplaced cache cheaply (per-file NUMA placement is not exposed without `move_pages` or
+  `/proc/<pid>/numa_maps` of a running process) and evicting automatically only then would remove that step.
+- [ ] `bitnet_b1_58-large` prompt processing at 16 threads was 0.71x slower with `--numa distribute` (466 against
+  660 t/s). Every other case was within 10% or faster; not investigated.
+- [ ] `run_inference_server.py` was only smoke-tested with the flag (starts, answers, 44.5 t/s on 2B-4T), not
+  benchmarked under load.
+
 ## Untested
 
 - [ ] ARM, Windows and macOS builds and runs. The ARM scalar path was only tested as an x86 build without AVX2,

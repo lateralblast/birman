@@ -5,6 +5,9 @@ import argparse
 import platform
 import subprocess
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from numa_distribute import with_numa
+
 def run_command(command, shell=False, log_step=None):
     """Run a system command and ensure it succeeds."""
     if log_step:
@@ -43,7 +46,7 @@ def run_benchmark():
         '-p', str(args.n_prompt),
         '-r', '5'
     ]
-    run_command(command)
+    run_command(with_numa(command, enabled=not args.no_numa, model=args.model, evict=args.numa_evict))
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Setup the environment for running the inference')
@@ -51,6 +54,8 @@ def parse_args():
     parser.add_argument("-n", "--n-token", type=int, help="Number of generated tokens", required=False, default=128)
     parser.add_argument("-p", "--n-prompt", type=int, help="Prompt to generate text from", required=False, default=512)
     parser.add_argument("-t", "--threads", type=int, help="Number of threads to use", required=False, default=2)
+    parser.add_argument("--no-numa", action="store_true", help="Do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
+    parser.add_argument("--numa-evict", action="store_true", help="Evict the model file from the page cache before launching so the pinned threads place it (multi-socket only; also: BITNET_NUMA_EVICT=1)")
     return parser.parse_args()
 
 if __name__ == "__main__":

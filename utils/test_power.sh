@@ -161,6 +161,10 @@ calculate_power() {
     }' "$log_file"
 }
 
+# On multi-socket machines add --numa distribute to llama-bench (see numa_distribute.py; BITNET_NUMA=0 disables it)
+NUMA_ARGS=$(python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/numa_distribute.py" --args 2>/dev/null || true)
+[ -n "$NUMA_ARGS" ] && echo "NUMA: running llama-bench with '$NUMA_ARGS'" >&2
+
 # Pick the power source
 POWER_USED=""
 case "$POWER_SOURCE" in
@@ -230,7 +234,7 @@ run_benchmark() {
     esac
     
     # Run benchmark
-    ./build/bin/llama-bench -m "$MODEL_PATH" -p 128 $n_flag -t "$threads" -ngl 0 > "$BENCH_OUTPUT" 2>&1
+    ./build/bin/llama-bench -m "$MODEL_PATH" -p 128 $n_flag -t "$threads" -ngl 0 $NUMA_ARGS > "$BENCH_OUTPUT" 2>&1
     
     # Stop measuring and work out average power (W): package, and DRAM where available
     local power="0" dram="NA"

@@ -5,6 +5,8 @@ import platform
 import argparse
 import subprocess
 
+from numa_distribute import with_numa
+
 def run_command(command, shell=False):
     """Run a system command and ensure it succeeds."""
     try:
@@ -47,7 +49,7 @@ def run_inference():
             command += ['--chat-template-file', template]
     else:
         command += ['-p', args.prompt, '-no-cnv']
-    run_command(command)
+    run_command(with_numa(command, enabled=not args.no_numa, model=args.model, evict=args.numa_evict))
 
 def signal_handler(sig, frame):
     print("Ctrl+C pressed, exiting...")
@@ -63,6 +65,8 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--threads", type=int, help="Number of threads to use", required=False, default=2)
     parser.add_argument("-c", "--ctx-size", type=int, help="Size of the prompt context", required=False, default=2048)
     parser.add_argument("-temp", "--temperature", type=float, help="Temperature, a hyperparameter that controls the randomness of the generated text", required=False, default=0.8)
+    parser.add_argument("--no-numa", action='store_true', help="Do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
+    parser.add_argument("--numa-evict", action='store_true', help="Evict the model file from the page cache before launching so the pinned threads place it (multi-socket only; also: BITNET_NUMA_EVICT=1)")
     parser.add_argument("-cnv", "--conversation", action='store_true', help="Whether to enable chat mode or not (for instruct models.)")
     parser.add_argument("--chat-template-file", type=str, help="Jinja chat template to use in chat mode (default: built in for BitNet-b1.58-2B-4T, otherwise the model's own)", required=False, default=None)
 

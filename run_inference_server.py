@@ -5,6 +5,8 @@ import platform
 import argparse
 import subprocess
 
+from numa_distribute import with_numa
+
 def run_command(command, shell=False):
     """Run a system command and ensure it succeeds."""
     try:
@@ -52,7 +54,7 @@ def run_server():
     # Note: -cnv flag is removed as it's not supported by the server
     
     print(f"Starting server on {args.host}:{args.port}")
-    run_command(command)
+    run_command(with_numa(command, enabled=not args.no_numa, model=args.model, evict=args.numa_evict))
 
 def signal_handler(sig, frame):
     print("Ctrl+C pressed, shutting down server...")
@@ -68,6 +70,8 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--threads", type=int, help="Number of threads to use", required=False, default=2)
     parser.add_argument("-c", "--ctx-size", type=int, help="Size of the context window", required=False, default=2048)
     parser.add_argument("--temperature", type=float, help="Temperature for sampling", required=False, default=0.8)
+    parser.add_argument("--no-numa", action='store_true', help="Do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
+    parser.add_argument("--numa-evict", action='store_true', help="Evict the model file from the page cache before launching so the pinned threads place it (multi-socket only; also: BITNET_NUMA_EVICT=1)")
     parser.add_argument("--host", type=str, help="IP address to listen on", required=False, default="127.0.0.1")
     parser.add_argument("--port", type=int, help="Port to listen on", required=False, default=8080)
     parser.add_argument("--chat-template-file", type=str, help="Jinja chat template for /v1/chat/completions (default: built in for BitNet-b1.58-2B-4T, otherwise the model's own)", required=False, default=None)

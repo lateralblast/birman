@@ -87,16 +87,39 @@
 > | unpinned, pp128 | 6.3 | 12.9 | 24.9 | 48.6 | 85.7 | 96.4 | 139.8 | 159.5 |
 > | unpinned, tg128 | 2.8 | 5.6 | 8.1 | 13.2 | 17.3 | 17.8 | 18.6 | 17.2 |
 >
-> Unpinned, prompt processing scales almost linearly up to 8 threads, then more slowly, and keeps gaining with SMT up to 48-64 threads; generation stops scaling at about 16 threads. NUMA placement matters a lot on this two-socket machine (pp128 / tg128 at the thread count shown):
+> With the default placement (no NUMA options) prompt processing scales almost linearly up to 8 threads, then more slowly, and keeps gaining with SMT up to 48-64 threads; generation stops scaling at about 16 threads. That plateau is a placement problem, not a hardware limit:
 >
-> | Placement | 2B-4T | Llama3-8B |
-> |---|---:|---:|
-> | one socket (`numactl --cpunodebind=0 --membind=0`), 16 threads | 254.3 / 22.3 | 98.5 / 12.8 |
-> | unpinned, 32 threads | 274.8 / 30.2 | 96.4 / 17.8 |
-> | interleaved (`numactl --interleave=all`), 32 threads | 397.3 / 32.2 | 180.6 / 18.3 |
-> | interleaved, 64 threads | 475.8 / 31.1 | 162.1 / 18.2 |
+> **NUMA placement is the biggest effect on this machine.** By default the model's pages sit on one NUMA node and the threads float between nodes, so generation is limited by one node's memory bandwidth (about 56 GB/s of weights for Llama3-8B; pinned to one socket it gets 41 GB/s, 12.8 t/s). llama.cpp's `--numa distribute` pins the threads evenly across the nodes, so each thread first-touches, and places in its own node's memory, the weight rows it always handles, and every read is local. `llama-bench -p 128 -n 128 -r 3`, the model's page cache evicted and then populated under each variant (t/s; ratio is `--numa distribute` over default):
 >
-> Interleaving the model's memory across both sockets gives 45% (2B-4T) and 88% (Llama3-8B) more prompt throughput than the default at 32 threads, and a little more generation; one socket on its own is limited to about 12.8 t/s for the 8B (about 41 GB/s of weights). Run on a multi-socket machine as `numactl --interleave=all build/bin/llama-bench ...`. The unpinned numbers are noisy and depend on which node the model file's pages happen to sit in: the same 2B-4T at 32 threads gave 275 pp128 in the sweep and 467 in the power test below (I did not verify why).
+> | Model | Threads | pp128 default | pp128 distribute | tg128 default | tg128 distribute | tg ratio |
+> |---|---:|---:|---:|---:|---:|---:|
+> | bitnet_b1_58-large | 32 | 749 | 953 | 112.8 | 143.6 | 1.27 |
+> | bitnet_b1_58-large | 64 | 823 | 1289 | 81.2 | 141.7 | 1.74 |
+> | BitNet-2B-4T | 32 | 286 | 416 | 30.4 | 58.4 | 1.92 |
+> | BitNet-2B-4T | 64 | 458 | 516 | 28.5 | 51.2 | 1.79 |
+> | bitnet_b1_58-3B | 32 | 183 | 299 | 35.9 | 55.9 | 1.56 |
+> | bitnet_b1_58-3B | 64 | 266 | 308 | 32.7 | 54.8 | 1.68 |
+> | Llama3-8B | 32 | 96.9 | 179.6 | 18.3 | 33.8 | 1.85 |
+> | Llama3-8B | 64 | 144 | 172 | 15.9 | 31.7 | 1.99 |
+>
+> At 8 and 16 threads generation was 1.12-1.30x faster for all four models, and prompt processing was within 10% apart from 2B-4T and 3B at 16 threads (1.33x, 1.44x) and `bitnet_b1_58-large` at 16 threads, the one case where it was slower (466 against 660, 0.71x). Llama3-8B at 32 threads moves about 3.2 GB of weights per token at 33.8 t/s, 109 GB/s, against about 136 GB/s theoretical for the two sockets.
+>
+> **Where the pages were first touched matters.** The same test (32 threads, tg128 in t/s) with the model's pages first placed in different ways, and with `numactl --interleave=all` for comparison:
+>
+> | Starting state | Variant | 2B-4T | Llama3-8B |
+> |---|---|---:|---:|
+> | cache evicted, populated by the run | default | 29.4 | 17.3 |
+> | | `--numa distribute` | **60.0** | **32.4** |
+> | | `numactl --interleave=all` | 29.2 | 18.6 |
+> | | both | 57.2 | 31.4 |
+> | all pages preloaded onto node 0 (like right after copying the file) | default | 29.4 | 17.8 |
+> | | `--numa distribute` | 33.6 | 19.4 |
+> | | `numactl --interleave=all` | 29.4 | 18.5 |
+> | | both | 34.0 | 19.5 |
+>
+> So `numactl --interleave=all` does nothing for generation, and `--numa distribute` roughly doubles it, but only when the pinned threads are the ones that place the pages: with the pages already on one node (just copied or downloaded, or placed by an earlier run without the flag) it gains about 10-15%. The page-cache state also explains why my first runs on this machine were so variable: unpinned numbers for the same model at 32 threads ranged from 275 to 467 pp128 depending on what had touched the file before (and my first suite wrongly showed interleaving helping prompt processing by 45-88%, which later runs with a settled cache did not reproduce). A fresh start needs no care; after copying or downloading a model, evict it once and let the next run place it.
+>
+> **The scripts now do this by default** on Linux machines with more than one NUMA node (`numa_distribute.py`): `run_inference.py`, `run_inference_server.py`, `utils/e2e_benchmark.py` and `utils/test_power.sh` add `--numa distribute`. `--no-numa` (or `BITNET_NUMA=0`) turns it off, a `--numa` already given is respected, and `--numa-evict` (or `BITNET_NUMA_EVICT=1`) drops the model from the page cache before launching so the pinned threads place it. Through `run_inference.py -n 128 -t 32` on this machine (tokens per second): 2B-4T 28.6 with `--no-numa` on an evicted cache, 53.9 with the default and `--numa-evict`, 56.4 with the default again once the cache is placed; Llama3-8B 18.7, 33.7 and 33.8; `run_inference_server.py` starts with the flag and answers (44.5 t/s on 2B-4T). Tested only on this 2-node Xeon; machines with more nodes (for example AMD EPYC) or ARM servers are untested.
 >
 > **GEMM kernel, `utils/test_gemm_kernel.sh -i 500`** (single-threaded, n = 2048 unless noted): 60 GFLOPS for one token (0.14 ms), 81-87 GFLOPS for 128 to 2048 tokens, 101 GFLOPS for the 8192-wide `ffn_down` case, against 150-207 on the i9-9900 (5.0 GHz turbo).
 >
