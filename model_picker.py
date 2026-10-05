@@ -2,9 +2,10 @@
 
 Used by start_llama.py when no -m is given. The policy:
 
-  1. Candidates are the canonical quantized outputs of setup_env.py, models/*/ggml-model-{i2_s,tl1,tl2}.gguf and
-     the -f16emb variant (f32 files, embedding models and stale *.bad/*.old/... variants are ignored; where both
-     exist the -f16emb file of a directory wins). Parameter counts are read from the GGUF header.
+  1. Candidates are the canonical quantized outputs of setup_env.py, models/*/ggml-model-{i2_s,tl1,tl2}.gguf, the
+     -f16emb variant and the -q8emb variant build.sh writes (token embedding as Q8_0: same perplexity, faster
+     generation). f32 files, embedding models and stale *.bad/*.old/... variants are ignored; within a directory
+     -q8emb wins over -f16emb, which wins over the plain file. Parameter counts are read from the GGUF header.
   2. A model fits when 1.2 x its file size + 0.5 GiB is within the memory that is actually available (MemAvailable,
      lowered by a cgroup memory limit).
   3. Candidates are tried best first. The ranking is "chat-capable first, then more parameters" (--prefer chat, the
@@ -25,7 +26,7 @@ import struct
 import subprocess
 import time
 
-CANONICAL = re.compile(r"^ggml-model-(i2_s|tl1|tl2)(-f16emb)?\.gguf$")
+CANONICAL = re.compile(r"^ggml-model-(i2_s|tl1|tl2)(-f16emb|-q8emb)?\.gguf$")
 CHAT_HINTS = ("instruct", "2b-4t")
 MEM_FACTOR = 1.2
 MEM_OVERHEAD = 512 * 1024 * 1024
@@ -149,7 +150,7 @@ def _file_key(path):
 # --- candidates ----------------------------------------------------------------------------------------------
 
 def find_models(models_dir):
-    """Canonical model files under models_dir; the -f16emb variant wins within a directory."""
+    """Canonical model files under models_dir; within a directory -q8emb wins, then -f16emb, then the plain file."""
     by_dir = {}
     for root, _dirs, files in os.walk(models_dir):
         for name in files:
@@ -157,7 +158,7 @@ def find_models(models_dir):
                 by_dir.setdefault(root, []).append(name)
     out = []
     for root, names in sorted(by_dir.items()):
-        pick = next((n for n in names if "-f16emb" in n), sorted(names)[0])
+        pick = next((n for suffix in ("-q8emb", "-f16emb") for n in sorted(names) if suffix in n), sorted(names)[0])
         out.append(os.path.join(root, pick))
     return out
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot build: submodule -> patches -> venv + requirements -> model -> setup_env.py.
+# One-shot build: submodule -> patches -> venv + requirements -> model -> setup_env.py -> Q8_0-embedding copy.
 # Safe to re-run; every step is skipped when already done.
 #
 # Usage: ./build.sh [-m MODEL_DIR] [-r HF_GGUF_REPO] [-q i2_s|tl1|tl2] [-v VENV_DIR] [-s] [-h]
@@ -63,20 +63,20 @@ patches=("$ROOT"/patches/llama.cpp/*.patch)
 for i in "${!patches[@]}"; do
   p=${patches[$i]}
   name=$(basename "$p")
+  # check "superseded" before the forward apply: a patch whose lines a later patch rewrote can still pass
+  # `git apply --check` and would be applied a second time (0010 was, on top of 0011)
+  superseded=0
+  for q in "${patches[@]:$((i + 1))}"; do
+    if git -C "$SUB" apply --reverse --check "$q" 2>/dev/null; then superseded=1; break; fi
+  done
   if git -C "$SUB" apply --reverse --check "$p" 2>/dev/null; then
     echo "already applied: $name"
+  elif [ "$superseded" -eq 1 ]; then
+    echo "already applied (superseded by a later patch): $name"
   elif git -C "$SUB" apply --check "$p" 2>/dev/null; then
     git -C "$SUB" apply "$p" && echo "applied: $name"
   else
-    superseded=0
-    for q in "${patches[@]:$((i + 1))}"; do
-      if git -C "$SUB" apply --reverse --check "$q" 2>/dev/null; then superseded=1; break; fi
-    done
-    if [ "$superseded" -eq 1 ]; then
-      echo "already applied (superseded by a later patch): $name"
-    else
-      die "$name does not apply to the submodule at $(git -C "$SUB" rev-parse --short HEAD)"
-    fi
+    die "$name does not apply to the submodule at $(git -C "$SUB" rev-parse --short HEAD)"
   fi
 done
 
@@ -120,8 +120,33 @@ fi
 log "Running setup_env.py (kernel codegen, cmake build)"
 python setup_env.py -md "$MODEL_DIR" -q "$QUANT"
 
-# 7. report ------------------------------------------------------------------
-GGUF=$(compgen -G "$MODEL_DIR/ggml-model-*.gguf" | head -1 || true)
+# 7. Q8_0 token embedding ----------------------------------------------------
+# An f16 token embedding that is also the output projection (2B-4T: 657 MB of 1188) is read for every generated
+# token. As Q8_0 it gave the same perplexity (16.6436 against 16.6467) and 25% faster generation on an M1 Max.
+# llama-quantize copies the I2_S tensors unchanged (same target type) and converts only the embedding. Only f16/f32
+# embeddings are converted: an I2_S embedding cannot be dequantized (its to_float takes a scale argument).
+SRC="$MODEL_DIR/ggml-model-i2_s-f16emb.gguf"   # Falcon3: the plain file has an I2_S embedding
+[ -f "$SRC" ] || SRC="$MODEL_DIR/ggml-model-i2_s.gguf"
+DST="$MODEL_DIR/ggml-model-i2_s-q8emb.gguf"
+if [ "$QUANT" = "i2_s" ] && [ -f "$SRC" ] && [ ! -f "$DST" ]; then
+  ETYPE=$(python - "$SRC" <<'PY'
+import sys
+from gguf import GGUFReader
+print(next((t.tensor_type.name for t in GGUFReader(sys.argv[1]).tensors if t.name == "token_embd.weight"), "none"))
+PY
+)
+  if [ "$ETYPE" = "F16" ] || [ "$ETYPE" = "F32" ]; then
+    log "Writing $DST (token embedding $ETYPE -> Q8_0)"
+    build/bin/llama-quantize --allow-requantize --token-embedding-type q8_0 "$SRC" "$DST.tmp" I2_S > logs/quantize_q8emb.log 2>&1 \
+      || die "llama-quantize failed, see logs/quantize_q8emb.log"
+    mv "$DST.tmp" "$DST"
+  else
+    log "Not writing $DST: token embedding is $ETYPE"
+  fi
+fi
+
+# 8. report ------------------------------------------------------------------
+GGUF=$(compgen -G "$MODEL_DIR/ggml-model-i2_s-q8emb.gguf" || compgen -G "$MODEL_DIR/ggml-model-*.gguf" | head -1 || true)
 log "Done"
 echo "binaries: $ROOT/build/bin/{llama-cli,llama-completion,llama-server,llama-quantize}"
 if [ -n "$GGUF" ]; then

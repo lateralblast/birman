@@ -1,0 +1,135 @@
+NEON I2_S kernels: ggml_vec_dot_i2_i8_s and ggml_gemm_i2_i8_s
+
+On ARM the I2_S mat-mul ran the scalar fallback. These follow the AVX2 kernels: a 128-element block is
+two 16-byte halves of four 2-bit planes, the codes 0-2 are multiplied with the int8 activations through
+ggml_vdotq_s32 (sdot with DOTPROD, vmull otherwise), the result is sum(code * y) and the n % 128 tail is
+added with ggml_i2s_tail_dot. gemm uses 4x4 tiles of 16 int32x4 accumulators; leftover rows and columns
+go through vec_dot. gemv already calls vec_dot.
+
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1433,6 +1433,43 @@
+         sumi += ggml_i2s_tail_dot(x_row, y, n);
+         s[row] = (float)sumi;
+     }
++#elif defined(__ARM_NEON)
++    // NEON: same layout and convention as the AVX2 path. A 128-element block is 32 bytes, loaded as two
++    // 16-byte halves; bit-plane p (>> 6, >> 4, >> 2, >> 0) of half h holds elements p*32 + h*16 .. +15.
++    // The codes 0-2 fit in int8, so ggml_vdotq_s32 (sdot with DOTPROD) accumulates code * y into int32.
++    (void)bs; (void)by;
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t  *)vy;
++    const int nb = n / 128;
++    const uint8x16_t mask = vdupq_n_u8(0x03);
++
++    for (int row = 0; row < nrc; row++) {
++        const uint8_t * x_row = x + row * bx / 4;
++        int32x4_t acc0 = vdupq_n_s32(0);
++        int32x4_t acc1 = vdupq_n_s32(0);
++        int32x4_t acc2 = vdupq_n_s32(0);
++        int32x4_t acc3 = vdupq_n_s32(0);
++
++        for (int i = 0; i < nb; i++) {
++            const uint8_t * px = x_row + i * 32;
++            const int8_t  * py = y + i * 128;
++            const uint8x16_t q0 = vld1q_u8(px);
++            const uint8x16_t q1 = vld1q_u8(px + 16);
++
++            acc0 = ggml_vdotq_s32(acc0, vreinterpretq_s8_u8(vshrq_n_u8(q0, 6)),               vld1q_s8(py +   0));
++            acc1 = ggml_vdotq_s32(acc1, vreinterpretq_s8_u8(vshrq_n_u8(q1, 6)),               vld1q_s8(py +  16));
++            acc2 = ggml_vdotq_s32(acc2, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 4), mask)), vld1q_s8(py +  32));
++            acc3 = ggml_vdotq_s32(acc3, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 4), mask)), vld1q_s8(py +  48));
++            acc0 = ggml_vdotq_s32(acc0, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q0, 2), mask)), vld1q_s8(py +  64));
++            acc1 = ggml_vdotq_s32(acc1, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q1, 2), mask)), vld1q_s8(py +  80));
++            acc2 = ggml_vdotq_s32(acc2, vreinterpretq_s8_u8(vandq_u8(q0, mask)),               vld1q_s8(py +  96));
++            acc3 = ggml_vdotq_s32(acc3, vreinterpretq_s8_u8(vandq_u8(q1, mask)),               vld1q_s8(py + 112));
++        }
++
++        int32_t sumi = vaddvq_s32(vaddq_s32(vaddq_s32(acc0, acc1), vaddq_s32(acc2, acc3)));
++        sumi += ggml_i2s_tail_dot(x_row, y, n);
++        s[row] = (float)sumi;
++    }
+ #else
+     // Scalar fallback. Same layout and convention as the AVX2 path above: blocks of 128 elements in
+     // 32 bytes (element j of a block in byte j % 32, bits 6 - 2 * (j / 32)), then the n % 128 tail
+--- a/ggml/src/ggml-cpu/ggml-cpu-i2s.c
++++ b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+@@ -182,6 +182,78 @@
+     }
+ 
+     // Handle remaining A rows (< 4); ggml_vec_dot_i2_i8_s adds the tail itself
++    for (; r < nc; r++) {
++        for (int64_t c = 0; c < nr; c++) {
++            ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1,
++                (const uint8_t *)vx + r * a_row_bytes, n,
++                (const int8_t *)vy + c * n, 0, 1);
++        }
++    }
++#elif defined(__ARM_NEON)
++    // NEON: 4 weight rows x 4 activation columns per tile, like the AVX2 path. Each 128-element block is
++    // two 16-byte halves of 4 bit-planes (see ggml_vec_dot_i2_i8_s); the tile walks half by half and plane
++    // by plane so the 16 accumulators, 4 unpacked rows and 4 activation vectors stay in registers.
++    const uint8_t * x = (const uint8_t *)vx;
++    const int8_t  * y = (const int8_t  *)vy;
++    const int64_t a_row_bytes = n / 4;
++    const int64_t nb = n / 128;
++    const uint8x16_t mask = vdupq_n_u8(0x03);
++
++    int64_t r = 0;
++    for (; r + 4 <= nc; r += 4) {
++        int64_t c = 0;
++        for (; c + 4 <= nr; c += 4) {
++            int32x4_t acc[4][4];
++            for (int i = 0; i < 4; i++)
++                for (int j = 0; j < 4; j++)
++                    acc[i][j] = vdupq_n_s32(0);
++
++            for (int64_t bl = 0; bl < nb; bl++) {
++                for (int h = 0; h < 2; h++) {
++                    uint8x16_t q[4];
++                    for (int i = 0; i < 4; i++)
++                        q[i] = vld1q_u8(x + (r + i) * a_row_bytes + bl * 32 + h * 16);
++
++                    for (int p = 0; p < 4; p++) {
++                        const int shift = 6 - 2 * p;
++                        int8x16_t a[4];
++                        for (int i = 0; i < 4; i++)
++                            a[i] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q[i], vdupq_n_s8(-shift)), mask));
++
++                        for (int j = 0; j < 4; j++) {
++                            const int8x16_t b = vld1q_s8(y + (c + j) * n + bl * 128 + p * 32 + h * 16);
++                            for (int i = 0; i < 4; i++)
++                                acc[i][j] = ggml_vdotq_s32(acc[i][j], a[i], b);
++                        }
++                    }
++                }
++            }
++
++            for (int i = 0; i < 4; i++)
++                for (int j = 0; j < 4; j++)
++                    s[(c + j) * bs + (r + i)] = (float)vaddvq_s32(acc[i][j]);
++        }
++
++        // the tiles above only cover whole 128-element blocks; add the tail for these 4 rows
++        if (n % 128 != 0) {
++            for (int i = 0; i < 4; i++) {
++                for (int64_t col = 0; col < c; col++) {
++                    s[col * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + col * n, n);
++                }
++            }
++        }
++
++        // remaining B columns (< 4); ggml_vec_dot_i2_i8_s adds the tail itself
++        for (; c < nr; c++) {
++            for (int i = 0; i < 4; i++) {
++                ggml_vec_dot_i2_i8_s(n, s + c * bs + r + i, 1,
++                    (const uint8_t *)vx + (r + i) * a_row_bytes, n,
++                    (const int8_t *)vy + c * n, 0, 1);
++            }
++        }
++    }
++
++    // remaining A rows (< 4)
+     for (; r < nc; r++) {
+         for (int64_t c = 0; c < nr; c++) {
+             ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1,

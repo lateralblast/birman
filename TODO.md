@@ -5,36 +5,37 @@ described in the notice at the top of `README.md`.
 
 ## Code gaps
 
-- [ ] **No NEON I2_S kernel.** On ARM the I2_S mat-mul runs the scalar fallback. Since patch `0007` it is correct
-  (layout, `sum(code*y)` convention and row tails all match the AVX2 path, and it was verified on an x86 build with
-  AVX2 off), but it is slow. A NEON `vec_dot`/`gemm` (with the row tail from `ggml_i2s_tail_dot`) would be a
-  performance item, and the harness approach used for `0006`/`0007` (random ternary matrices at several row
-  lengths against a scalar reference, now `utils/test_i2s_kernels.c`) would verify it. `src/ggml-bitnet-mad.cpp`
-  has old NEON kernels, but it is not compiled into the build and uses a 64-element block that does not match the
-  128-element packing.
 - [ ] **The `*_interleaved` GEMM/GEMV functions have no callers.** They now assert on rows that are not a multiple
   of 128 instead of silently skipping the tail. Delete them or give them tail support if something starts using them.
 - [ ] Row lengths for I2_S must be a multiple of 4 (asserted in `quantize_i2_s`).
 
-## ARM / Apple Silicon: first steps
+## ARM / Apple Silicon
 
-Nothing has run on real ARM yet (see `README.md`, Known issues). The compiled I2_S kernels on aarch64 are the scalar
-fallback only; `ggml-aarch64.c` and `ggml-bitnet-compute.c` in the submodule are never built. `CLAUDE.md` (gitignored,
-copy it by hand) has the full handoff; the essentials:
+Done on an M1 Max (see `README.md`, Known issues): the build (patch `0009`, CPU-only on macOS), correctness against
+the x86 reference, NEON `vec_dot`/`gemm` (patches `0010`/`0011`: 2B-4T pp512 392.6 / tg128 77.0 t/s, from 4.72 / 3.55 scalar)
+and the macOS thread/memory detection in `start_llama.py`.
 
-- [ ] `./build.sh`, then the kernel unit test (`utils/test_i2s_kernels.c`, must print `ALL OK`), then a 2B-4T generation
-  (`The capital of France is Paris. Paris is a city that is known for its rich history, culture,`) and
-  `python utils/test_server_api.py` (18/18).
-- [ ] I2_S against f32 perplexity on `bitnet_b1_58-large` (WikiText-2 100 k slice; reference 12.9532 against 12.9638 on
-  8 chunks, 11.8181 on the whole slice), then speed with `llama-bench` and the performance-core count as `-t`.
-- [ ] A NEON `ggml_vec_dot_i2_i8_s` and `ggml_gemm_i2_i8_s` (new patch `0009`), following the layout, the
-  `sum(code*y)` convention and the row tail in `ggml_i2s_tail_dot`; verify with the unit test, then perplexity.
-- [ ] macOS portability: `start_llama.py` reads `/proc` and `/sys` (thread default would count efficiency cores; use
-  `sysctl hw.perflevel0.physicalcpu`, `hw.memsize`, `vm_stat`), `build.sh` assumes bash 4+, `utils/test_gemm_kernel.sh`
-  looks for `libggml.so` and uses `-march=native`, `utils/test_power.sh` is Intel/Linux only, and
-  `utils/cleanup_stale_models.sh` uses GNU `stat`/`numfmt`.
+- [x] The other models on ARM: all six match the x86 perplexities, `-q8emb` files are equally accurate (table in
+  `README.md`).
+- [ ] Other ARM CPUs, and the NEON path without DOTPROD (`ggml_vdotq_s32` falls back to `vmull`; compiled, not run).
+- [x] Token embedding as Q8_0 (`build.sh` writes `-q8emb`, the picker prefers it): 2B-4T generation 69.4 -> 86.6 t/s at
+  equal perplexity. `build.sh -m DIR` adds the `-q8emb` file for any model (from `-f16emb` when present).
+  Tied embeddings gain generation speed; untied ones (Falcon-E, Falcon3, Llama3-8B) only shrink.
+- [ ] Generation: a tg profile (f16 embedding) was 43% barrier wait, 40% the f16 output matmul, 12% I2_S `vec_dot`.
+  Untested: `--poll`, and 7 threads for generation (94.9 against 90.2 t/s at 8, not conclusive).
+- [ ] More prompt speed. Done in `0011` (2x8 tiles, NEON activation quantization: pp512 232 -> 393 t/s). A profile
+  of pp512 after it: `gemm` 64% (at about 150 of the 191 GMAC/s `sdot` peak per core), threads waiting at barriers
+  16.5%, flash attention 5%, `quantize_row_i8_s` 4.6% before its NEON loop, RMS norm 3%. What is left is mostly
+  barrier time and upstream ops, not the I2_S kernel. Interleaved means on an idle M1 Max: pp512 232.1 (`0010`), 381.5
+  (2x8 tile, old quantizer), 392.6 t/s (`0011`); tg128 69.3 -> 77.0. Fewer threads did not help (8: 340, 7: 321, 6: 314); raising thread
+  priority (`--prio`) needs root on macOS and is untested.
 - [ ] TL1: `setup_env.py` runs `codegen_tl1.py` on arm64 but always passes `-DBITNET_ARM_TL1=OFF`, so TL1 is never
   compiled in; untested.
+- [ ] Metal: the built `ggml-metal/` backend has no I2_S support (the I2_S shaders are only in the legacy, unbuilt
+  `ggml-metal.m`/`.metal`), so macOS builds are CPU-only.
+- [ ] macOS scripts: `utils/test_gemm_kernel.sh` looks for `libggml.so` and uses `-march=native`,
+  `utils/test_power.sh` is Intel/Linux only, `utils/cleanup_stale_models.sh` uses GNU `stat`/`numfmt`, and
+  `build.sh` needs a bash 4+ first on `PATH` (Homebrew's).
 
 ## NUMA
 
@@ -49,8 +50,8 @@ copy it by hand) has the full handoff; the essentials:
   660 t/s). Every other case was within 10% or faster; not investigated.
 - [ ] `start_llama.py` defaults `-t` to the physical core count, which maximises generation; prompt-heavy workloads
   gained a little from SMT threads on the Xeon (2B-4T pp128 516 at 64 threads against 416 at 32) and almost nothing
-  on the i9 (209 against 205). A `--prompt-heavy` option, or choosing by workload, is untested. On non-Linux systems
-  the thread count falls back to the logical CPU count, and only AVX2/ARM warnings are tuned for x86_64 and aarch64.
+  on the i9 (209 against 205). A `--prompt-heavy` option, or choosing by workload, is untested. On systems other than
+  Linux and macOS the thread count falls back to the logical CPU count.
 - [ ] `run_inference_server.py` was only smoke-tested with the flag (starts, answers, 44.5 t/s on 2B-4T), not
   benchmarked under load.
 

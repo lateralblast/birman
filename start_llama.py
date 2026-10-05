@@ -24,8 +24,9 @@ flags below) reaches --min-tps (default 10 t/s) is used, with the reasoning prin
 measurement, --reprobe ignores the cache (kept 7 days; the speed depends on the load at the time) and
 --models-dir looks elsewhere. --check still runs the probe when it has to choose.
 
-It also warns about things that make I2_S slow or wrong: no AVX2 on x86 or an ARM CPU (both run the scalar
-fallback, there is no NEON kernel), and too little free RAM for the model. Anything it does not recognise is
+It also warns about things that make I2_S slow or wrong: no AVX2 on x86 (the scalar fallback runs; ARM has NEON
+kernels), and too little free RAM for the model. On macOS -t is the performance-core count (sysctl
+hw.perflevel0.physicalcpu) and memory comes from sysctl and vm_stat. Anything it does not recognise is
 passed to the llama binary unchanged, and a flag you give yourself (-t is ours; --numa, -ngl and
 --chat-template-file are yours) is never overridden.
 
@@ -38,6 +39,7 @@ import os
 import platform
 import re
 import shlex
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -132,19 +134,55 @@ def cpu_model_and_simd():
     return model, flags
 
 
+def sysctl(name):
+    try:
+        out = subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
+def darwin_mem_kb():
+    """macOS: {"MemTotal", "MemAvailable"} in kB from sysctl and vm_stat (free + inactive + speculative pages)."""
+    out = {}
+    total = sysctl("hw.memsize")
+    if total and total.isdigit():
+        out["MemTotal"] = int(total) // 1024
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        vm = ""
+    m = re.search(r"page size of (\d+) bytes", vm)
+    pages = [re.search(r"^Pages %s:\s+(\d+)" % k, vm, re.MULTILINE) for k in ("free", "inactive", "speculative")]
+    if m and all(pages):
+        out["MemAvailable"] = sum(int(x.group(1)) for x in pages) * int(m.group(1)) // 1024
+    return out
+
+
 def detect():
     cpus = allowed_cpus()
-    sockets, cores = topology(cpus)
     limit = cgroup_cpu_limit()
-    threads = cores
+    if platform.system() == "Darwin":
+        # Apple Silicon: threads = performance cores. The efficiency cores slow the barrier-synchronized threads
+        # down (2B-4T generation on an M1 Max: about 64 t/s at 8 threads, 14 t/s at 10).
+        sockets = 1
+        phys, perf = sysctl("hw.physicalcpu"), sysctl("hw.perflevel0.physicalcpu")
+        cores = int(phys) if phys and phys.isdigit() else len(cpus)
+        threads = int(perf) if perf and perf.isdigit() else cores
+        mem = darwin_mem_kb()
+    else:
+        sockets, cores = topology(cpus)
+        threads = cores
+        mem = meminfo_kb()
     if limit is not None:
         threads = max(1, min(threads, int(math.floor(limit))))
-    mem = meminfo_kb()
     avail_kb = mem.get("MemAvailable", 0)
     cg_mem = cgroup_mem_available()
     if cg_mem is not None:
         avail_kb = min(avail_kb, cg_mem // 1024)
     model, flags = cpu_model_and_simd()
+    if platform.system() == "Darwin":
+        model = sysctl("machdep.cpu.brand_string") or model
     return {
         "arch": platform.machine(), "cpu": model, "flags": flags,
         "logical": len(cpus), "cores": cores, "sockets": sockets, "numa_nodes": numa.numa_node_count(),
@@ -159,8 +197,6 @@ def warnings_for(m, model_bytes):
     arch = m["arch"].lower()
     if arch in ("x86_64", "amd64") and "avx2" not in m["flags"]:
         out.append("this CPU has no AVX2: I2_S runs the scalar fallback, which is correct but slow")
-    if arch in ("aarch64", "arm64", "armv8l"):
-        out.append("ARM: I2_S runs the scalar fallback (there is no NEON kernel), which is correct but slow")
     if model_bytes and m["mem_avail_gb"] and model_bytes / 1073741824.0 * 1.1 > m["mem_avail_gb"]:
         out.append("the model is %.1f GiB but only %.1f GiB of RAM is available: expect swapping or a failed load"
                    % (model_bytes / 1073741824.0, m["mem_avail_gb"]))

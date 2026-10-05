@@ -1,0 +1,154 @@
+Move quantize_i2_s() and dequantize_row_i2_s() from ggml-cpu to ggml-base
+
+ggml.c (ggml-base) references both functions through type_traits and
+ggml_quantize_chunk(), but they were defined in ggml-cpu/quants.c, so
+libggml-base had undefined symbols. ELF shared libraries resolve them when
+libggml-cpu is loaded; the macOS linker refuses to link libggml-base.dylib.
+They are plain scalar code declared in ggml-quants.h, so they belong in
+ggml-quants.c with the other quantize_* functions.
+
+--- a/ggml/src/ggml-quants.c
++++ b/ggml/src/ggml-quants.c
+@@ -5593,3 +5593,66 @@
+ 
+ // ====================== BitNet I2_S quantization functions ======================
+ 
++void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t n, const float i2_scale) {
++    static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
++    const int64_t n_full = n - n % 128;
++    for (int64_t done = 0; done < n_full; done += 128) {
++        for (int gp = 0; gp < 32; gp++) {
++            uint8_t byte = x[(done/4) + gp];
++            y[done + 0*32 + gp] = i2_scale * map2bit[(byte >> 6) & 0x03];
++            y[done + 1*32 + gp] = i2_scale * map2bit[(byte >> 4) & 0x03];
++            y[done + 2*32 + gp] = i2_scale * map2bit[(byte >> 2) & 0x03];
++            y[done + 3*32 + gp] = i2_scale * map2bit[(byte >> 0) & 0x03];
++        }
++    }
++    // tail: n % 128 elements, packed 4 per byte in order (see ggml_i2s_tail_dot)
++    for (int64_t k = 0; k < n - n_full; k++) {
++        y[n_full + k] = i2_scale * map2bit[(x[n_full/4 + k/4] >> (6 - 2 * (k % 4))) & 0x03];
++    }
++}
++
++size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
++    (void)quant_weights;
++    int64_t n = nrow * n_per_row;
++
++    double max = 0.0;
++    for (int64_t i = 0; i < n; i++) {
++        double v = fabs((double)src[i]);
++        if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
++    }
++
++    // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels, per row:
++    // blocks of 128 elements packed into 32 bytes, where element j of a block goes
++    // to byte (j % 32) at bit position 6 - 2 * (j / 32). The last n_per_row % 128 elements
++    // (see ggml_i2s_tail_dot) follow, packed 4 per byte in order, so a row is n_per_row / 4 bytes.
++    GGML_ASSERT(n_per_row % 4 == 0 && "I2_S requires the row length to be a multiple of 4");
++    const int64_t n_full = n_per_row - n_per_row % 128;
++
++    uint8_t * q = (uint8_t *)dst;
++    memset(q, 0, n / 4);
++
++    for (int64_t i = 0; i < n; i++) {
++        uint8_t val;
++        if (fabs((double)src[i]) < 1e-6) {
++            val = 1; // maps to 0
++        } else {
++            val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
++        }
++        const int64_t row = i / n_per_row;
++        const int64_t col = i % n_per_row;
++        uint8_t * qr = q + row * (n_per_row / 4);
++        if (col < n_full) {
++            const int64_t blk = col / 128;
++            const int     j   = (int)(col % 128);
++            qr[blk * 32 + (j % 32)] |= (uint8_t)(val << (6 - 2 * (j / 32)));
++        } else {
++            const int64_t k = col - n_full;
++            qr[n_full / 4 + k / 4] |= (uint8_t)(val << (6 - 2 * (k % 4)));
++        }
++    }
++
++    float * scale_ptr = (float *)(q + n / 4);
++    scale_ptr[0] = (float)max;
++
++    return nrow * n_per_row / 4 + 32;
++}
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1331,73 +1331,8 @@
+ 
+ void quantize_row_i8_s_4x1(const float * x, void * y, int64_t n, float* act_scales, int32_t* act_sums) {
+     quantize_row_i8_s(x, y, n, act_scales, act_sums);
+-}
+-
+-void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t n, const float i2_scale) {
+-    static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
+-    const int64_t n_full = n - n % 128;
+-    for (int64_t done = 0; done < n_full; done += 128) {
+-        for (int gp = 0; gp < 32; gp++) {
+-            uint8_t byte = x[(done/4) + gp];
+-            y[done + 0*32 + gp] = i2_scale * map2bit[(byte >> 6) & 0x03];
+-            y[done + 1*32 + gp] = i2_scale * map2bit[(byte >> 4) & 0x03];
+-            y[done + 2*32 + gp] = i2_scale * map2bit[(byte >> 2) & 0x03];
+-            y[done + 3*32 + gp] = i2_scale * map2bit[(byte >> 0) & 0x03];
+-        }
+-    }
+-    // tail: n % 128 elements, packed 4 per byte in order (see ggml_i2s_tail_dot)
+-    for (int64_t k = 0; k < n - n_full; k++) {
+-        y[n_full + k] = i2_scale * map2bit[(x[n_full/4 + k/4] >> (6 - 2 * (k % 4))) & 0x03];
+-    }
+ }
+ 
+-size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+-    (void)quant_weights;
+-    int64_t n = nrow * n_per_row;
+-
+-    double max = 0.0;
+-    for (int64_t i = 0; i < n; i++) {
+-        double v = fabs((double)src[i]);
+-        if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
+-    }
+-
+-    // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels, per row:
+-    // blocks of 128 elements packed into 32 bytes, where element j of a block goes
+-    // to byte (j % 32) at bit position 6 - 2 * (j / 32). The last n_per_row % 128 elements
+-    // (see ggml_i2s_tail_dot) follow, packed 4 per byte in order, so a row is n_per_row / 4 bytes.
+-    GGML_ASSERT(n_per_row % 4 == 0 && "I2_S requires the row length to be a multiple of 4");
+-    const int64_t n_full = n_per_row - n_per_row % 128;
+-
+-    uint8_t * q = (uint8_t *)dst;
+-    memset(q, 0, n / 4);
+-
+-    for (int64_t i = 0; i < n; i++) {
+-        uint8_t val;
+-        if (fabs((double)src[i]) < 1e-6) {
+-            val = 1; // maps to 0
+-        } else {
+-            val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+-        }
+-        const int64_t row = i / n_per_row;
+-        const int64_t col = i % n_per_row;
+-        uint8_t * qr = q + row * (n_per_row / 4);
+-        if (col < n_full) {
+-            const int64_t blk = col / 128;
+-            const int     j   = (int)(col % 128);
+-            qr[blk * 32 + (j % 32)] |= (uint8_t)(val << (6 - 2 * (j / 32)));
+-        } else {
+-            const int64_t k = col - n_full;
+-            qr[n_full / 4 + k / 4] |= (uint8_t)(val << (6 - 2 * (k % 4)));
+-        }
+-    }
+-
+-    float * scale_ptr = (float *)(q + n / 4);
+-    scale_ptr[0] = (float)max;
+-
+-    return nrow * n_per_row / 4 + 32;
+-}
+-
+-
+ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
+ #if defined(__AVX2__)
+     const uint8_t *    x = (uint8_t *)vx;

@@ -1,0 +1,324 @@
+NEON I2_S prompt processing: 2x8 gemm tiles, constant-shift unpack, NEON quantize_row_i8_s
+
+ggml_gemm_i2_i8_s on NEON now takes 2 weight rows x 8 activation columns per tile (each unpacked weight
+vector feeds 8 sdots; no register spills), keeps the 4x4 tile for a last group of 4 columns, and unpacks
+the bit-planes with constant shifts (the 0010 version shifted by a variable, which compiled to widening
+instructions). The I2_S mul_mat path in ggml-cpu.c passes 8 columns per call on NEON (4 elsewhere, so
+x86 is unchanged). quantize_row_i8_s gets a NEON loop with bit-identical results (vrndaq_f32 rounds like
+roundf, saturating narrows clamp). On an M1 Max, single core: gemm 75 -> 150 GMAC/s; quantize 5.6x;
+2B-4T pp512 at 8 threads 220.6 -> 387.0 t/s.
+
+--- a/ggml/src/ggml-cpu/ggml-cpu-i2s.c
++++ b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+@@ -34,7 +34,143 @@
+         ggml_vec_dot_i2_i8_s(n, s + iir0, 1, (const uint8_t *)vx + iir0 * n / 4, n, vy, 0, blck_0);
+     }
+ #endif
++}
++
++#if defined(__ARM_NEON) && !defined(__AVX2__)
++// NEON I2_S tiles. A 128-element block is two 16-byte halves of 4 bit-planes (see ggml_vec_dot_i2_i8_s):
++// plane p (>> 6, >> 4, >> 2, >> 0) of half h holds elements p*32 + h*16 .. +15, codes 0-2.
++static inline int8x16_t i2s_plane(uint8x16_t q, int p) {
++    const uint8x16_t mask = vdupq_n_u8(0x03);
++    switch (p) {
++        case 0:  return vreinterpretq_s8_u8(vshrq_n_u8(q, 6));
++        case 1:  return vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 4), mask));
++        case 2:  return vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q, 2), mask));
++        default: return vreinterpretq_s8_u8(vandq_u8(q, mask));
++    }
++}
++
++// 2 weight rows x 8 activation columns per tile: each unpacked weight vector feeds 8 sdots, and the
++// 16 accumulators, 2 packed rows, 2 unpacked planes and the activation vector fit in the 32 registers.
++// nr must be a multiple of 8; a last odd row goes through vec_dot.
++static void ggml_gemm_i2_i8_s_neon_2x8(int n, float * GGML_RESTRICT s, size_t bs, const uint8_t * GGML_RESTRICT x,
++                                       const int8_t * GGML_RESTRICT y, int nr, int nc) {
++    const int64_t a_row_bytes = n / 4;
++    const int64_t nb = n / 128;
++
++    int64_t r = 0;
++    for (; r + 2 <= nc; r += 2) {
++        const uint8_t * x0 = x + (r + 0) * a_row_bytes;
++        const uint8_t * x1 = x + (r + 1) * a_row_bytes;
++        for (int64_t c = 0; c < nr; c += 8) {
++            const int8_t * yc = y + c * n;
++            int32x4_t acc0[8], acc1[8];
++            for (int j = 0; j < 8; j++) {
++                acc0[j] = vdupq_n_s32(0);
++                acc1[j] = vdupq_n_s32(0);
++            }
++
++            for (int64_t bl = 0; bl < nb; bl++) {
++                for (int h = 0; h < 2; h++) {
++                    const uint8x16_t q0 = vld1q_u8(x0 + bl * 32 + h * 16);
++                    const uint8x16_t q1 = vld1q_u8(x1 + bl * 32 + h * 16);
++                    for (int p = 0; p < 4; p++) {
++                        const int8x16_t a0 = i2s_plane(q0, p);
++                        const int8x16_t a1 = i2s_plane(q1, p);
++                        const int8_t * yb = yc + bl * 128 + p * 32 + h * 16;
++                        for (int j = 0; j < 8; j++) {
++                            const int8x16_t b = vld1q_s8(yb + j * n);
++                            acc0[j] = ggml_vdotq_s32(acc0[j], a0, b);
++                            acc1[j] = ggml_vdotq_s32(acc1[j], a1, b);
++                        }
++                    }
++                }
++            }
++
++            for (int j = 0; j < 8; j++) {
++                int32_t s0 = vaddvq_s32(acc0[j]);
++                int32_t s1 = vaddvq_s32(acc1[j]);
++                if (n % 128 != 0) {
++                    s0 += ggml_i2s_tail_dot(x0, yc + j * n, n);
++                    s1 += ggml_i2s_tail_dot(x1, yc + j * n, n);
++                }
++                s[(c + j) * bs + r + 0] = (float)s0;
++                s[(c + j) * bs + r + 1] = (float)s1;
++            }
++        }
++    }
++
++    for (; r < nc; r++) {
++        for (int64_t c = 0; c < nr; c++) {
++            ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1, x + r * a_row_bytes, n, y + c * n, 0, 1);
++        }
++    }
++}
++
++// 4 weight rows x 4 activation columns per tile, for column counts that are not a multiple of 8.
++static void ggml_gemm_i2_i8_s_neon_4x4(int n, float * GGML_RESTRICT s, size_t bs, const uint8_t * GGML_RESTRICT x,
++                                       const int8_t * GGML_RESTRICT y, int nr, int nc) {
++    const int64_t a_row_bytes = n / 4;
++    const int64_t nb = n / 128;
++
++    int64_t r = 0;
++    for (; r + 4 <= nc; r += 4) {
++        int64_t c = 0;
++        for (; c + 4 <= nr; c += 4) {
++            int32x4_t acc[4][4];
++            for (int i = 0; i < 4; i++)
++                for (int j = 0; j < 4; j++)
++                    acc[i][j] = vdupq_n_s32(0);
++
++            for (int64_t bl = 0; bl < nb; bl++) {
++                for (int h = 0; h < 2; h++) {
++                    uint8x16_t q[4];
++                    for (int i = 0; i < 4; i++)
++                        q[i] = vld1q_u8(x + (r + i) * a_row_bytes + bl * 32 + h * 16);
++
++                    for (int p = 0; p < 4; p++) {
++                        int8x16_t a[4];
++                        for (int i = 0; i < 4; i++)
++                            a[i] = i2s_plane(q[i], p);
++
++                        for (int j = 0; j < 4; j++) {
++                            const int8x16_t b = vld1q_s8(y + (c + j) * n + bl * 128 + p * 32 + h * 16);
++                            for (int i = 0; i < 4; i++)
++                                acc[i][j] = ggml_vdotq_s32(acc[i][j], a[i], b);
++                        }
++                    }
++                }
++            }
++
++            for (int i = 0; i < 4; i++)
++                for (int j = 0; j < 4; j++)
++                    s[(c + j) * bs + (r + i)] = (float)vaddvq_s32(acc[i][j]);
++        }
++
++        // the tiles above only cover whole 128-element blocks; add the tail for these 4 rows
++        if (n % 128 != 0) {
++            for (int i = 0; i < 4; i++) {
++                for (int64_t col = 0; col < c; col++) {
++                    s[col * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + col * n, n);
++                }
++            }
++        }
++
++        // remaining B columns (< 4); ggml_vec_dot_i2_i8_s adds the tail itself
++        for (; c < nr; c++) {
++            for (int i = 0; i < 4; i++) {
++                ggml_vec_dot_i2_i8_s(n, s + c * bs + r + i, 1, x + (r + i) * a_row_bytes, n, y + c * n, 0, 1);
++            }
++        }
++    }
++
++    // remaining A rows (< 4)
++    for (; r < nc; r++) {
++        for (int64_t c = 0; c < nr; c++) {
++            ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1, x + r * a_row_bytes, n, y + c * n, 0, 1);
++        }
++    }
+ }
++#endif
+ 
+ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+     // nr = number of activation columns (B side)
+@@ -190,76 +326,14 @@
+         }
+     }
+ #elif defined(__ARM_NEON)
+-    // NEON: 4 weight rows x 4 activation columns per tile, like the AVX2 path. Each 128-element block is
+-    // two 16-byte halves of 4 bit-planes (see ggml_vec_dot_i2_i8_s); the tile walks half by half and plane
+-    // by plane so the 16 accumulators, 4 unpacked rows and 4 activation vectors stay in registers.
+-    const uint8_t * x = (const uint8_t *)vx;
+-    const int8_t  * y = (const int8_t  *)vy;
+-    const int64_t a_row_bytes = n / 4;
+-    const int64_t nb = n / 128;
+-    const uint8x16_t mask = vdupq_n_u8(0x03);
+-
+-    int64_t r = 0;
+-    for (; r + 4 <= nc; r += 4) {
+-        int64_t c = 0;
+-        for (; c + 4 <= nr; c += 4) {
+-            int32x4_t acc[4][4];
+-            for (int i = 0; i < 4; i++)
+-                for (int j = 0; j < 4; j++)
+-                    acc[i][j] = vdupq_n_s32(0);
+-
+-            for (int64_t bl = 0; bl < nb; bl++) {
+-                for (int h = 0; h < 2; h++) {
+-                    uint8x16_t q[4];
+-                    for (int i = 0; i < 4; i++)
+-                        q[i] = vld1q_u8(x + (r + i) * a_row_bytes + bl * 32 + h * 16);
+-
+-                    for (int p = 0; p < 4; p++) {
+-                        const int shift = 6 - 2 * p;
+-                        int8x16_t a[4];
+-                        for (int i = 0; i < 4; i++)
+-                            a[i] = vreinterpretq_s8_u8(vandq_u8(vshlq_u8(q[i], vdupq_n_s8(-shift)), mask));
+-
+-                        for (int j = 0; j < 4; j++) {
+-                            const int8x16_t b = vld1q_s8(y + (c + j) * n + bl * 128 + p * 32 + h * 16);
+-                            for (int i = 0; i < 4; i++)
+-                                acc[i][j] = ggml_vdotq_s32(acc[i][j], a[i], b);
+-                        }
+-                    }
+-                }
+-            }
+-
+-            for (int i = 0; i < 4; i++)
+-                for (int j = 0; j < 4; j++)
+-                    s[(c + j) * bs + (r + i)] = (float)vaddvq_s32(acc[i][j]);
+-        }
+-
+-        // the tiles above only cover whole 128-element blocks; add the tail for these 4 rows
+-        if (n % 128 != 0) {
+-            for (int i = 0; i < 4; i++) {
+-                for (int64_t col = 0; col < c; col++) {
+-                    s[col * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + col * n, n);
+-                }
+-            }
+-        }
+-
+-        // remaining B columns (< 4); ggml_vec_dot_i2_i8_s adds the tail itself
+-        for (; c < nr; c++) {
+-            for (int i = 0; i < 4; i++) {
+-                ggml_vec_dot_i2_i8_s(n, s + c * bs + r + i, 1,
+-                    (const uint8_t *)vx + (r + i) * a_row_bytes, n,
+-                    (const int8_t *)vy + c * n, 0, 1);
+-            }
+-        }
++    // NEON: 2x8 tiles over groups of 8 activation columns, then 4x4 tiles over a remaining group of 4,
++    // then vec_dot for the rest. Both tiles add the row tail themselves.
++    const int64_t nr8 = nr - nr % 8;
++    if (nr8 > 0) {
++        ggml_gemm_i2_i8_s_neon_2x8(n, s, bs, (const uint8_t *)vx, (const int8_t *)vy, nr8, nc);
+     }
+-
+-    // remaining A rows (< 4)
+-    for (; r < nc; r++) {
+-        for (int64_t c = 0; c < nr; c++) {
+-            ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1,
+-                (const uint8_t *)vx + r * a_row_bytes, n,
+-                (const int8_t *)vy + c * n, 0, 1);
+-        }
++    if (nr > nr8) {
++        ggml_gemm_i2_i8_s_neon_4x4(n, s + nr8 * bs, bs, (const uint8_t *)vx, (const int8_t *)vy + nr8 * n, nr - nr8, nc);
+     }
+ #else
+     // Scalar / non-AVX2 fallback: one vec_dot per (weight row, activation column), s[col * bs + row]
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1508,19 +1508,26 @@
+         const int64_t n_rows = src0_end - src0_start;
+         const float ws = *scale;
+ 
+-        // GEMM path: process 4 columns at a time, write directly to destination
++        // GEMM path: process groups of columns (8 on NEON, whose gemm uses 2x8 tiles; 4 elsewhere; a last
++        // group of 4 on NEON), write directly to destination
++#if defined(__ARM_NEON) && !defined(__AVX2__)
++        const int64_t gemm_group = 8;
++#else
++        const int64_t gemm_group = 4;
++#endif
+         if (ne11 >= 4) {
+             const int64_t n_gemm_cols = ne11 - ne11 % 4;
+-            // Use a small per-column temp buffer (only n_rows floats, not n_rows*n_cols)
+-            float * tmp = (float *)alloca(n_rows * 4 * sizeof(float));
++            // Use a small per-group temp buffer (n_rows * gemm_group floats, not n_rows*n_cols)
++            float * tmp = (float *)alloca(n_rows * gemm_group * sizeof(float));
+ 
+-            for (int64_t col_start = 0; col_start < n_gemm_cols; col_start += 4) {
++            for (int64_t col_start = 0; col_start < n_gemm_cols; col_start += gemm_group) {
++                const int64_t ncols = MIN(gemm_group, n_gemm_cols - col_start);
+                 ggml_gemm_i2_i8_s(ne00, tmp, n_rows,
+                     (const char *)src0->data + src0_start * nb01 / 4,
+                     (const char *)src1_wdata + src1_col_stride * col_start,
+-                    4, n_rows);
++                    ncols, n_rows);
+ 
+-                for (int64_t col = 0; col < 4; col++) {
++                for (int64_t col = 0; col < ncols; col++) {
+                     float * dst_row = (float *)((char *)dst->data + (col_start + col) * nb1) + src0_start;
+                     const float post_scale = ws / act_scales[col_start + col];
+                     const int32_t asum = act_sums[col_start + col];
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1310,16 +1310,43 @@
+ #endif
+ 
+ void quantize_row_i8_s(const float * x, void * y, int64_t n, float* act_scales, int32_t* act_sums) {
++    int8_t * dst = (int8_t *)y;
++    int64_t i0 = 0;   // first element the scalar loops handle
+     float amax = 0.0f;
+-    for (int i = 0; i < n; i++) {
++#if defined(__ARM_NEON) && defined(__aarch64__)
++    // NEON over multiples of 16, scalar for the rest. Same result as the scalar loops: vrndaq_f32 rounds half
++    // away from zero like roundf, and the saturating narrows clamp to [-128, 127].
++    const int64_t n16 = n - n % 16;
++    float32x4_t vmax = vdupq_n_f32(0.0f);
++    for (int64_t i = 0; i < n16; i += 4) {
++        vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + i)));
++    }
++    amax = vmaxvq_f32(vmax);
++    i0 = n16;
++#endif
++    for (int64_t i = i0; i < n; i++) {
+         amax = MAX(amax, fabsf(x[i]));
+     }
+     float s = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+     act_scales[0] = s;
+ 
+     int32_t sum = 0;
+-    int8_t * dst = (int8_t *)y;
+-    for (int i = 0; i < n; i++) {
++#if defined(__ARM_NEON) && defined(__aarch64__)
++    int32x4_t vsum = vdupq_n_s32(0);
++    for (int64_t i = 0; i < n16; i += 16) {
++        int32x4_t q[4];
++        for (int k = 0; k < 4; k++) {
++            q[k] = vcvtq_s32_f32(vrndaq_f32(vmulq_n_f32(vld1q_f32(x + i + 4 * k), s)));
++        }
++        const int16x8_t h0 = vcombine_s16(vqmovn_s32(q[0]), vqmovn_s32(q[1]));
++        const int16x8_t h1 = vcombine_s16(vqmovn_s32(q[2]), vqmovn_s32(q[3]));
++        const int8x16_t b  = vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1));
++        vst1q_s8(dst + i, b);
++        vsum = vpadalq_s16(vsum, vpaddlq_s8(b));
++    }
++    sum = vaddvq_s32(vsum);
++#endif
++    for (int64_t i = i0; i < n; i++) {
+         int v = (int)roundf(x[i] * s);
+         if (v >  127) v =  127;
+         if (v < -128) v = -128;

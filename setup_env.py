@@ -76,6 +76,9 @@ COMPILER_EXTRA_ARGS = {
 
 OS_EXTRA_ARGS = {
     "Windows":["-T", "ClangCL"],
+    # CPU only: even with -ngl 0, llama.cpp hands large-batch mat-muls to the Metal and Accelerate BLAS
+    # backends, which cannot run I2_S (BLAS segfaults in dequantize_row_i2_s, Metal fails a ggml_nbytes assert)
+    "Darwin":["-DGGML_METAL=OFF", "-DGGML_BLAS=OFF"],
 }
 
 ARCH_ALIAS = {
@@ -231,14 +234,16 @@ def apply_patches():
     def check(args, patch):
         return subprocess.run(base + args + ["--check", str(patch)], capture_output=True).returncode == 0
 
+    # The superseded test must come before the forward one: a patch whose lines a later patch rewrote can still
+    # pass `git apply --check` and would then be applied a second time (0010 was, on top of 0011).
     for i, patch in enumerate(patches):
         if check(["--reverse"], patch):
             logging.info(f"Patch {patch.name} already applied.")
+        elif any(check(["--reverse"], later) for later in patches[i + 1:]):
+            logging.info(f"Patch {patch.name} already applied (superseded by a later patch).")
         elif check([], patch):
             run_command(base + [str(patch)], log_step=f"apply_patch_{patch.stem}")
             logging.info(f"Applied patch {patch.name}.")
-        elif any(check(["--reverse"], later) for later in patches[i + 1:]):
-            logging.info(f"Patch {patch.name} already applied (superseded by a later patch).")
         else:
             logging.error(f"Patch {patch.name} does not apply to {sub}; check the submodule revision.")
             sys.exit(1)

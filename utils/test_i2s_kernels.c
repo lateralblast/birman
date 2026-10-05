@@ -37,7 +37,9 @@ static void check(const char * what, int k, int m, int n, const float * got, con
 
 int main(void) {
     const int ks[] = {64, 128, 132, 200, 256, 320, 8640};
-    const int m = 11, n = 7;
+    // n = 13 columns: on NEON 8 go through the 2x8 tile, 4 through the 4x4 tile, 1 through vec_dot; m = 11 rows
+    // leaves an odd row for the 2x8 tile and 3 rows for the 4x4 one
+    const int m = 11, n = 13;
     srand(1234);
     for (size_t ki = 0; ki < sizeof ks / sizeof ks[0]; ki++) {
         const int k = ks[ki];
@@ -68,7 +70,7 @@ int main(void) {
         check("gemv", k, m, n, out, ref, m * n, 0, 0, 0);
         memset(out, 0, sizeof(float) * m * n);
         ggml_gemm_i2_i8_s(k, out, m, q, y, n, m);
-        check("gemm (4x4 tiles)", k, m, n, out, ref, m * n, 0, 0, 0);
+        check("gemm (tiles)", k, m, n, out, ref, m * n, 0, 0, 0);
         memset(out, 0, sizeof(float) * m * n);
         struct params p = {0, 1, 0, NULL, NULL, false};
         bool ok = llamafile_sgemm_i2s(&p, m, n, k, q, k, y, k, out, m, NULL, NULL, 0.f);
