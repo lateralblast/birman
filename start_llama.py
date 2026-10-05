@@ -4,6 +4,7 @@
     ./start_llama.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf              # llama-server
     ./start_llama.py --tool cli -m MODEL -p "Hello" -n 64                           # any other llama-* tool
     ./start_llama.py --check -m MODEL                                               # report only, run nothing
+    ./start_llama.py                                                                # no -m: pick the best model for this machine
 
 It inspects the machine and adds what the measurements in the README support:
 
@@ -16,7 +17,14 @@ It inspects the machine and adds what the measurements in the README support:
   -ngl 0            CPU only.
   --chat-template-file   the 2B-4T chat template, for the 2B-4T model when running the server or cli.
 
-and warns about things that make I2_S slow or wrong: no AVX2 on x86 or an ARM CPU (both run the scalar
+Without -m it also chooses the model (model_picker.py): the canonical GGUFs under models/ that fit in the available
+memory (a cgroup limit counts), tried best first - chat-capable models, then more parameters; --prefer largest ignores
+the chat preference - and the first whose measured generation speed (a few-second llama-bench probe run with the
+flags below) reaches --min-tps (default 10 t/s) is used, with the reasoning printed. --no-probe skips the
+measurement, --reprobe ignores the cache (kept 7 days; the speed depends on the load at the time) and
+--models-dir looks elsewhere. --check still runs the probe when it has to choose.
+
+It also warns about things that make I2_S slow or wrong: no AVX2 on x86 or an ARM CPU (both run the scalar
 fallback, there is no NEON kernel), and too little free RAM for the model. Anything it does not recognise is
 passed to the llama binary unchanged, and a flag you give yourself (-t is ours; --numa, -ngl and
 --chat-template-file are yours) is never overridden.
@@ -34,6 +42,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+import model_picker as picker  # noqa: E402
 import numa_distribute as numa  # noqa: E402
 
 TOOLS = {
@@ -91,6 +100,17 @@ def cgroup_cpu_limit(root="/sys/fs/cgroup"):
     return None
 
 
+def cgroup_mem_available(root="/sys/fs/cgroup"):
+    """Bytes left under a cgroup memory limit (which /proc/meminfo does not reflect), or None."""
+    limit, cur = _read(os.path.join(root, "memory.max")), _read(os.path.join(root, "memory.current"))
+    if limit is None:
+        limit = _read(os.path.join(root, "memory", "memory.limit_in_bytes"))
+        cur = _read(os.path.join(root, "memory", "memory.usage_in_bytes"))
+    if limit and cur and limit.strip().isdigit() and cur.strip().isdigit() and int(limit) < (1 << 60):
+        return max(0, int(limit) - int(cur))
+    return None
+
+
 def meminfo_kb():
     out = {}
     for line in (_read("/proc/meminfo") or "").splitlines():
@@ -120,12 +140,17 @@ def detect():
     if limit is not None:
         threads = max(1, min(threads, int(math.floor(limit))))
     mem = meminfo_kb()
+    avail_kb = mem.get("MemAvailable", 0)
+    cg_mem = cgroup_mem_available()
+    if cg_mem is not None:
+        avail_kb = min(avail_kb, cg_mem // 1024)
     model, flags = cpu_model_and_simd()
     return {
         "arch": platform.machine(), "cpu": model, "flags": flags,
         "logical": len(cpus), "cores": cores, "sockets": sockets, "numa_nodes": numa.numa_node_count(),
         "cgroup_limit": limit, "threads": threads,
-        "mem_total_gb": mem.get("MemTotal", 0) / 1048576.0, "mem_avail_gb": mem.get("MemAvailable", 0) / 1048576.0,
+        "mem_total_gb": mem.get("MemTotal", 0) / 1048576.0, "mem_avail_gb": avail_kb / 1048576.0,
+        "cgroup_mem": cg_mem is not None,
     }
 
 
@@ -137,7 +162,7 @@ def warnings_for(m, model_bytes):
     if arch in ("aarch64", "arm64", "armv8l"):
         out.append("ARM: I2_S runs the scalar fallback (there is no NEON kernel), which is correct but slow")
     if model_bytes and m["mem_avail_gb"] and model_bytes / 1073741824.0 * 1.1 > m["mem_avail_gb"]:
-        out.append("the model is %.1f GB but only %.1f GB of RAM is available: expect swapping or a failed load"
+        out.append("the model is %.1f GiB but only %.1f GiB of RAM is available: expect swapping or a failed load"
                    % (model_bytes / 1073741824.0, m["mem_avail_gb"]))
     return out
 
@@ -172,25 +197,79 @@ def parse(argv):
                                 epilog="Unrecognised arguments are passed to the llama binary unchanged.",
                                 allow_abbrev=False)
     p.add_argument("--tool", choices=sorted(TOOLS), default="server", help="which binary to run (default: server)")
-    p.add_argument("-m", "--model", help="path to the GGUF model")
+    p.add_argument("-m", "--model", help="path to the GGUF model (default: choose the best one for this machine from models/)")
     p.add_argument("-t", "--threads", type=int, help="thread count (default: physical cores this process may use)")
     p.add_argument("--check", "--dry-run", dest="check", action="store_true", help="report the machine and the command, run nothing")
     p.add_argument("--no-numa", action="store_true", help="do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
     p.add_argument("--numa-evict", action="store_true", help="evict the model from the page cache first (multi-socket only; also: BITNET_NUMA_EVICT=1)")
+    p.add_argument("--models-dir", default=os.path.join(ROOT, "models"), help="where to look for models when -m is not given (default: models/)")
+    p.add_argument("--prefer", choices=("chat", "largest"), default="chat", help="model choice when -m is not given: chat-capable models first, then more parameters (default), or just the most parameters")
+    p.add_argument("--min-tps", type=float, default=picker.DEFAULT_MIN_TPS, help="minimum measured generation speed for an automatically chosen model (default: %(default)s t/s)")
+    p.add_argument("--no-probe", action="store_true", help="choose the model by memory fit only, without measuring its speed")
+    p.add_argument("--reprobe", action="store_true", help="ignore cached speed measurements")
     p.add_argument("--bin-dir", default=os.path.join(ROOT, "build", "bin"), help="directory with the llama binaries")
     return p.parse_known_args(argv)
+
+
+def choose_model(args, m, threads):
+    """Pick a model from models/ for this machine (see model_picker.py). Returns (candidate or None, evicted paths)."""
+    cands = []
+    for path in picker.find_models(args.models_dir):
+        try:
+            cands.append(picker.describe(path))
+        except (OSError, ValueError) as e:
+            print("  skipping %s: %s" % (path, e), file=sys.stderr)
+    if not cands:
+        print("  no models found under %s (run ./build.sh, or pass -m MODEL.gguf)" % args.models_dir, file=sys.stderr)
+        return None, set()
+    mem = int(m["mem_avail_gb"] * 1073741824)
+    bench = os.path.join(args.bin_dir, TOOLS["bench"])
+    numa_extra, _reason = numa.explain([], not args.no_numa)
+    evicted = set()
+    probe = None
+    if args.no_probe:
+        print("  speed is not measured (--no-probe): choosing by memory fit only", file=sys.stderr)
+    elif not os.path.isfile(bench):
+        print("  %s not found, so speed cannot be measured: choosing by memory fit only" % bench, file=sys.stderr)
+    else:
+        key = "%s|%d|%d|%d" % (m["cpu"], m["cores"], m["sockets"], m["numa_nodes"])
+        evict = numa.evict_requested(args.numa_evict) and bool(numa_extra)
+
+        def probe(c):
+            def before():
+                if evict:
+                    numa.evict_from_page_cache(c["path"])
+                    evicted.add(c["path"])
+            return picker.probe_tps(bench, c["path"], threads, numa_extra, key, use_cache=not args.reprobe, before=before)
+
+    chosen, rows = picker.select(cands, mem, args.prefer, args.min_tps, probe)
+    print("Model selection (%s; at least %.0f t/s measured; needs 1.2x the file + 0.5 GiB of the %.1f GiB available):"
+          % ("chat-capable models first, then more parameters" if args.prefer == "chat" else "most parameters first",
+             args.min_tps, mem / 1073741824.0), file=sys.stderr)
+    for c, status in rows:
+        print("  %-30s %5.2f B  %5.2f GiB  %-5s %s%s" % (c["label"][:30], c["params"] / 1e9, c["size"] / 1073741824.0, "chat" if c["chat"] else "",
+                                                      status, "   <-- chosen" if chosen and c["path"] == chosen["path"] else ""), file=sys.stderr)
+    return chosen, evicted
 
 
 def main(argv=None):
     args, passthrough = parse(sys.argv[1:] if argv is None else argv)
     m = detect()
-    model_bytes = os.path.getsize(args.model) if args.model and os.path.isfile(args.model) else 0
+    threads = args.threads if args.threads else m["threads"]
 
-    print("Machine: %s (%s), %d socket(s), %d physical cores (%d logical CPUs usable), %d NUMA node(s), RAM %.0f GB (%.0f GB free)"
-          % (m["cpu"], m["arch"], m["sockets"], m["cores"], m["logical"], m["numa_nodes"], m["mem_total_gb"], m["mem_avail_gb"]),
-          file=sys.stderr)
+    print("Machine: %s (%s), %d socket(s), %d physical cores (%d logical CPUs usable), %d NUMA node(s), RAM %.0f GiB (%.0f GiB free%s)"
+          % (m["cpu"], m["arch"], m["sockets"], m["cores"], m["logical"], m["numa_nodes"], m["mem_total_gb"], m["mem_avail_gb"],
+             ", limited by a cgroup" if m["cgroup_mem"] else ""), file=sys.stderr)
     if m["cgroup_limit"] is not None:
         print("  cgroup CPU limit: %.1f CPUs" % m["cgroup_limit"], file=sys.stderr)
+
+    evicted = set()
+    if not args.model:
+        chosen, evicted = choose_model(args, m, threads)
+        if chosen:
+            args.model = chosen["path"]
+
+    model_bytes = os.path.getsize(args.model) if args.model and os.path.isfile(args.model) else 0
     for w in warnings_for(m, model_bytes):
         print("  WARNING: " + w, file=sys.stderr)
 
@@ -200,11 +279,10 @@ def main(argv=None):
         problems.append("%s not found: run ./build.sh first" % binary)
     if args.tool != "bench" or args.model:
         if not args.model:
-            problems.append("no model given (-m MODEL.gguf)")
+            problems.append("no model given or found (-m MODEL.gguf)")
         elif not os.path.isfile(args.model):
             problems.append("model not found: %s" % args.model)
 
-    threads = args.threads if args.threads else m["threads"]
     cmd, notes = build_command(binary, args.model, passthrough, threads, not args.no_numa, args.tool)
     print("  " + "; ".join(notes), file=sys.stderr)
     print("  command: " + shlex.join(cmd), file=sys.stderr)
@@ -218,7 +296,7 @@ def main(argv=None):
             print("  PROBLEM: " + pr, file=sys.stderr)
         return 0 if not problems else 2
 
-    if numa.evict_requested(args.numa_evict) and "--numa" in cmd and args.model:
+    if numa.evict_requested(args.numa_evict) and "--numa" in cmd and args.model and args.model not in evicted:
         print("  %s %s from the page cache" % ("evicted" if numa.evict_from_page_cache(args.model) else "could not evict", args.model),
               file=sys.stderr)
     os.execv(binary, cmd)

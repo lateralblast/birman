@@ -40,6 +40,17 @@ described in the notice at the top of `README.md`.
   470); not investigated. The default build requests OpenMP, but with no `libomp` installed CMake silently builds
   without it, which is the fast configuration. LTO was mixed (+11% prompt on 2B-4T, -8% on Llama3-8B), so it was not adopted.
 
+## Model selection
+
+- [ ] `model_picker.py` ranks by "chat-capable (name heuristic), then parameter count"; parameter count is only a
+  proxy for quality and nothing here measures answer quality, so the default pick (BitNet-2B-4T on both machines) is
+  a policy, not a benchmark result. A quality score per model (a downstream task, not perplexity, which is not
+  comparable across tokenizers) would let it choose better, for example whether Llama3-8B beats 2B-4T for chat.
+- [ ] The speed probe depends on the load at the time and, on multi-socket machines, on where the model's pages sit
+  (32 against 53 t/s for 2B-4T on the Xeon); `--numa-evict` makes it representative. Cached readings can be stale
+  for up to 7 days (`--reprobe`).
+- [ ] Only models under `models/` with the canonical file names are considered; other GGUFs need `-m`.
+
 ## Untested
 
 - [ ] ARM, Windows and macOS builds and runs. The ARM scalar path was only tested as an x86 build without AVX2,
