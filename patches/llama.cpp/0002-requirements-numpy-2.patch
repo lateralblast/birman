@@ -1,0 +1,10 @@
+diff --git a/requirements/requirements-convert_legacy_llama.txt b/requirements/requirements-convert_legacy_llama.txt
+index 28221fad0..ed9a903df 100644
+--- a/requirements/requirements-convert_legacy_llama.txt
++++ b/requirements/requirements-convert_legacy_llama.txt
+@@ -1,4 +1,4 @@
+-numpy~=1.26.4
++numpy>=2.0
+ sentencepiece>=0.1.98,<0.3.0
+ 
+ transformers==4.57.6

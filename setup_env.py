@@ -221,8 +221,25 @@ def compile():
     # run_command(["cmake", "--build", "build", "--target", "llama-cli", "--config", "Release"])
     run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
 
+def apply_patches():
+    # Local fixes for the pinned llama.cpp submodule, kept in patches/llama.cpp/.
+    # Idempotent: patches that are already applied are skipped.
+    sub = Path("3rdparty/llama.cpp")
+    for patch in sorted(Path("patches/llama.cpp").glob("*.patch")):
+        patch = patch.resolve()
+        base = ["git", "-C", str(sub), "apply"]
+        if subprocess.run(base + ["--reverse", "--check", str(patch)], capture_output=True).returncode == 0:
+            logging.info(f"Patch {patch.name} already applied.")
+        elif subprocess.run(base + ["--check", str(patch)], capture_output=True).returncode == 0:
+            run_command(base + [str(patch)], log_step=f"apply_patch_{patch.stem}")
+            logging.info(f"Applied patch {patch.name}.")
+        else:
+            logging.error(f"Patch {patch.name} does not apply to {sub}; check the submodule revision.")
+            sys.exit(1)
+
 def main():
     setup_gguf()
+    apply_patches()
     gen_code()
     compile()
     prepare_model()

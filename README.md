@@ -1,3 +1,30 @@
+> [!NOTE]
+> **This is a fork of [microsoft/BitNet](https://github.com/microsoft/BitNet)** (`birman`), kept to build and run on current Python and NumPy 2.x. Everything below this notice is the upstream README, unchanged.
+>
+> **Why:** upstream's pinned `llama.cpp` submodule requires `numpy~=1.26.4`, which has no wheel for newer Pythons, so `pip install -r requirements.txt` fails to build numpy (seen on Python 3.14.6). While fixing that, `BitNet-b1.58-2B-4T` also turned out to produce looping/garbage output with the pinned submodule commit.
+>
+> **What changed**
+> - `patches/llama.cpp/0002-requirements-numpy-2.patch` relaxes the submodule's numpy pin to `numpy>=2.0`.
+> - `patches/llama.cpp/0001-bitnet-b158-squared-relu-ffn.patch` fixes the `bitnet-b1.58` graph, which reused the 3B model's SiLU FFN instead of squared ReLU. This was the cause of the bad output.
+> - The submodule is a fork we can't push to, so fixes are kept as patches and applied idempotently by `setup_env.py` (`apply_patches()`).
+> - `build.sh` runs the whole sequence: submodule init, patches, venv and requirements, model download, `setup_env.py`.
+> - `run_inference.py` uses `llama-completion` for plain prompts (current `llama-cli` is chat-only), maps `-p` to the system prompt in `-cnv` mode, and uses `chat-templates/bitnet-b1.58-2B-4T.jinja` for the 2B-4T model. The GGUF's embedded template ends the prompt with an EOS token, which made chat answers unrelated to the question.
+> - `CLAUDE.md` documents the above for Claude Code.
+>
+> **Quick start:** `./build.sh`, then `python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -p "You are a helpful assistant" -cnv`
+>
+> **Verified:** Python 3.14.6, NumPy 2.5.3, clang 21, x86_64 Linux, `microsoft/BitNet-b1.58-2B-4T-gguf` (I2_S) with the I2_S kernel, correct completion and multi-turn chat output at about 20 t/s on 8 threads.
+>
+> **Remaining issues**
+> - Only the case above was tested. Not tested: ARM, Windows/macOS, TL1/TL2 kernels, the Falcon, Falcon-E, Llama3-8B and bitnet_b1_58 models, the embedding models, `run_inference_server.py` / `llama-server`, and the `utils/test_*` scripts.
+> - The 2B-4T chat model doesn't reliably emit an end-of-turn token, so `run_inference.py` stops on a `Human:` reverse prompt.
+> - The pinned submodule's `llama-quantize` has no `I2_S` entry, so the f32 to I2_S step in `setup_env.py` fails. Use a pre-quantized `-gguf` model (a fix exists upstream in `cea12e83f`, not applied here).
+> - On a fresh clone `pip install -r requirements.txt` still hits the old pin, because it runs before `setup_env.py` can patch it. Use `./build.sh`, or Python 3.10-3.12.
+> - The `gguf` Python package from PyPI lacks the BitNet enums; the `utils/convert-*` scripts need `PYTHONPATH=3rdparty/llama.cpp/gguf-py`.
+> - The `patches/` directory is a workaround; the real fix belongs in the llama.cpp fork the submodule points at.
+> - `setup_env.py` rewrites the tracked file `include/bitnet-lut-kernels.h` on every run.
+> - A `-cnv` reply may run on past the end of the answer for longer responses.
+
 <div align="center">
 
 # bitnet.cpp
