@@ -1,0 +1,105 @@
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index c8848b90e..96e3b51ec 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1499,18 +1499,24 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
+         s[row] = (float)sumi;
+     }
+ #else
+-    // Scalar fallback
++    // Scalar fallback. Same layout and convention as the AVX2 path above: blocks of 128 elements in
++    // 32 bytes (element j of a block in byte j % 32, bits 6 - 2 * (j / 32)), then the n % 128 tail
++    // (ggml_i2s_tail_dot), and the result is sum(code * y) with codes 0, 1, 2; the caller subtracts
++    // the activation sum.
++    (void)bs; (void)by;
+     const uint8_t * x = (const uint8_t *)vx;
+     const int8_t * y  = (const int8_t *)vy;
+-    static const int map2bit[4] = { -1, 0, 1, 0 };
++    const int64_t n_full = n - n % 128;
+     for (int row = 0; row < nrc; row++) {
++        const uint8_t * x_row = x + row * bx / 4;
+         int32_t sum = 0;
+-        for (int i = 0; i < n; i++) {
+-            int byte_idx = i / 4;
+-            int bit_pos = 6 - 2 * (i % 4);
+-            int w = map2bit[(x[row * (n/4) + byte_idx] >> bit_pos) & 0x03];
+-            sum += w * y[i];
++        for (int64_t b = 0; b < n_full; b += 128) {
++            const uint8_t * xb = x_row + b / 4;
++            for (int j = 0; j < 128; j++) {
++                sum += (int32_t)((xb[j % 32] >> (6 - 2 * (j / 32))) & 3) * y[b + j];
++            }
+         }
++        sum += ggml_i2s_tail_dot(x_row, y, n);
+         s[row] = (float)sum;
+     }
+ #endif
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-i2s.c b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+index 612494d09..fb4bb03d6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-i2s.c
++++ b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+@@ -190,40 +190,14 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
+         }
+     }
+ #else
+-    // Scalar / non-AVX2 fallback: use vec_dot row by row
+-    const int64_t row_block = ROW_BLOCK_SIZE;
+-    const int64_t col_block = COL_BLOCK_SIZE;
+-
+-#if defined(ACT_PARALLEL)
+-    for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
+-        int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
+-        for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
+-            int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
+-            const void * vy_r = (const uint8_t *)vy + r0 * n;
+-            for (int64_t c = 0; c < cur_c; ++c) {
+-                const int64_t col = c0 + c;
+-                float * s_col = s + col;
+-                const void * vx_col = (const uint8_t *)vx + col * n / 4;
+-                ggml_vec_dot_i2_i8_s(n, s_col + r0 * bs, bs, vx_col, n, vy_r, n, cur_r);
+-            }
+-        }
+-    }
+-#else
+-    for (int64_t r0 = 0; r0 < nr; r0 += row_block) {
+-        int64_t cur_r = (r0 + row_block <= nr) ? row_block : (nr - r0);
+-        const void * vy_row = (const uint8_t *)vy + r0 * n;
+-        for (int64_t c0 = 0; c0 < nc; c0 += col_block) {
+-            int64_t cur_c = (c0 + col_block <= nc) ? col_block : (nc - c0);
+-            for (int64_t r = 0; r < cur_r; ++r) {
+-                const int64_t row = r0 + r;
+-                float * s_row = s + row * bs;
+-                const void * vy_cur = (const uint8_t *)vy_row + r * n;
+-                const void * vx_c = (const uint8_t *)vx + c0 * n / 4;
+-                ggml_vec_dot_i2_i8_s(n, s_row + c0, bs, vx_c, n, vy_cur, n, cur_c);
+-            }
++    // Scalar / non-AVX2 fallback: one vec_dot per (weight row, activation column), s[col * bs + row]
++    for (int64_t c = 0; c < nr; c++) {
++        for (int64_t r = 0; r < nc; r++) {
++            ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1,
++                (const uint8_t *)vx + r * (n / 4), n,
++                (const int8_t *)vy + c * n, 0, 1);
+         }
+     }
+-#endif
+ #endif // __AVX2__
+ }
+ 
+@@ -243,6 +217,8 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
+ void ggml_gemm_i2_i8_s_interleaved(int n, float * GGML_RESTRICT s, size_t bs,
+     const void * GGML_RESTRICT vx_base, int64_t row_start, int64_t a_row_bytes,
+     const void * GGML_RESTRICT vy, int nr, int nc) {
++    // no row-tail support here (see ggml_i2s_tail_dot); this path has no callers
++    GGML_ASSERT(n % 128 == 0 && "interleaved I2_S kernels need a row length that is a multiple of 128");
+ #if defined(__AVX2__)
+     // For the interleaved layout, the data for row `r` at byte offset `off` is at:
+     //   group = r / 8
+@@ -438,6 +414,8 @@ void ggml_gemm_i2_i8_s_interleaved(int n, float * GGML_RESTRICT s, size_t bs,
+ void ggml_gemv_i2_i8_s_interleaved(int n, float * GGML_RESTRICT s, size_t bs,
+     const void * GGML_RESTRICT vx_base, int64_t row_start, int64_t a_row_bytes,
+     const void * GGML_RESTRICT vy, int nr, int nc) {
++    // no row-tail support here (see ggml_i2s_tail_dot); this path has no callers
++    GGML_ASSERT(n % 128 == 0 && "interleaved I2_S kernels need a row length that is a multiple of 128");
+     // GEMV is just GEMM with nr=1
+     ggml_gemm_i2_i8_s_interleaved(n, s, bs, vx_base, row_start, a_row_bytes, vy, nr, nc);
+ }

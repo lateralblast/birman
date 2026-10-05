@@ -1,0 +1,29 @@
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index 2b546c495..439d9877f 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -354,9 +354,11 @@ struct llm_tokenizer_bpe : llm_tokenizer {
+                 };
+                 break;
+             case LLAMA_VOCAB_PRE_TYPE_FALCON_E:
++                // tokenizer.json of Falcon-E-1B/3B-Instruct: Punctuation (contiguous), a Split with the
++                // case-aware pattern below, ByteLevel without its own regex, then single digits
+                 regex_exprs = {
+                     "[\\p{P}\\$\\+<=>\\^~\\|`]+",
+-                    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
++                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                     "[0-9]",
+                 };
+                 break;
+@@ -2155,6 +2157,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+             } else if (
+                     tokenizer_pre == "falcon") {
+                 pre_type = LLAMA_VOCAB_PRE_TYPE_FALCON;
++            } else if (
++                    tokenizer_pre == "falcon_e" ||
++                    tokenizer_pre == "falcon-e") {
++                // the converter writes "falcon_e"
++                pre_type = LLAMA_VOCAB_PRE_TYPE_FALCON_E;
+             } else if (
+                     tokenizer_pre == "mpt") {
+                 pre_type = LLAMA_VOCAB_PRE_TYPE_MPT;
