@@ -1,0 +1,15 @@
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 6ec673d92..c9867b9a9 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1368,7 +1368,9 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+     // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels:
+     // blocks of 128 elements packed into 32 bytes, where element j of a block goes
+     // to byte (j % 32) at bit position 6 - 2 * (j / 32).
+-    GGML_ASSERT(n % 128 == 0);
++    // The kernels walk each row in 128-element blocks and ignore any tail, so a row length that
++    // is not a multiple of 128 would be quantized into a layout they misread (garbage output).
++    GGML_ASSERT(n_per_row % 128 == 0 && "I2_S requires the row length to be a multiple of 128; keep this tensor in another type");
+ 
+     uint8_t * q = (uint8_t *)dst;
+     memset(q, 0, n / 4);

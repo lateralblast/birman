@@ -1,0 +1,177 @@
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index c9867b9a9..c8848b90e 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -5,6 +5,7 @@
+ #include "simd-mappings.h"
+ #include "ggml-quants.h"
+ #include "quants.h"
++#include "ggml-cpu-i2s.h"
+ 
+ #include "arch-fallback.h"
+ 
+@@ -1334,24 +1335,19 @@ void quantize_row_i8_s_4x1(const float * x, void * y, int64_t n, float* act_scal
+ 
+ void dequantize_row_i2_s(const uint8_t * x, float * y, int64_t n, const float i2_scale) {
+     static const float map2bit[4] = { -1.0f, 0.0f, 1.0f, 0.0f };
+-    int64_t done = 0;
+-    while (done < n) {
+-        int64_t cols0 = MIN(32, n - done - 0*32);
+-        int64_t cols1 = MIN(32, n - done - 1*32);
+-        int64_t cols2 = MIN(32, n - done - 2*32);
+-        int64_t cols3 = MIN(32, n - done - 3*32);
++    const int64_t n_full = n - n % 128;
++    for (int64_t done = 0; done < n_full; done += 128) {
+         for (int gp = 0; gp < 32; gp++) {
+             uint8_t byte = x[(done/4) + gp];
+-            uint8_t c0 = (byte >> 6) & 0x03;
+-            uint8_t c1 = (byte >> 4) & 0x03;
+-            uint8_t c2 = (byte >> 2) & 0x03;
+-            uint8_t c3 = (byte >> 0) & 0x03;
+-            if (gp < cols0) y[done + 0*32 + gp] = i2_scale * map2bit[c0];
+-            if (gp < cols1) y[done + 1*32 + gp] = i2_scale * map2bit[c1];
+-            if (gp < cols2) y[done + 2*32 + gp] = i2_scale * map2bit[c2];
+-            if (gp < cols3) y[done + 3*32 + gp] = i2_scale * map2bit[c3];
++            y[done + 0*32 + gp] = i2_scale * map2bit[(byte >> 6) & 0x03];
++            y[done + 1*32 + gp] = i2_scale * map2bit[(byte >> 4) & 0x03];
++            y[done + 2*32 + gp] = i2_scale * map2bit[(byte >> 2) & 0x03];
++            y[done + 3*32 + gp] = i2_scale * map2bit[(byte >> 0) & 0x03];
+         }
+-        done += 128;
++    }
++    // tail: n % 128 elements, packed 4 per byte in order (see ggml_i2s_tail_dot)
++    for (int64_t k = 0; k < n - n_full; k++) {
++        y[n_full + k] = i2_scale * map2bit[(x[n_full/4 + k/4] >> (6 - 2 * (k % 4))) & 0x03];
+     }
+ }
+ 
+@@ -1365,12 +1361,12 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+         if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
+     }
+ 
+-    // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels:
++    // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels, per row:
+     // blocks of 128 elements packed into 32 bytes, where element j of a block goes
+-    // to byte (j % 32) at bit position 6 - 2 * (j / 32).
+-    // The kernels walk each row in 128-element blocks and ignore any tail, so a row length that
+-    // is not a multiple of 128 would be quantized into a layout they misread (garbage output).
+-    GGML_ASSERT(n_per_row % 128 == 0 && "I2_S requires the row length to be a multiple of 128; keep this tensor in another type");
++    // to byte (j % 32) at bit position 6 - 2 * (j / 32). The last n_per_row % 128 elements
++    // (see ggml_i2s_tail_dot) follow, packed 4 per byte in order, so a row is n_per_row / 4 bytes.
++    GGML_ASSERT(n_per_row % 4 == 0 && "I2_S requires the row length to be a multiple of 4");
++    const int64_t n_full = n_per_row - n_per_row % 128;
+ 
+     uint8_t * q = (uint8_t *)dst;
+     memset(q, 0, n / 4);
+@@ -1382,9 +1378,17 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+         } else {
+             val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+         }
+-        const int64_t blk = i / 128;
+-        const int     j   = (int)(i % 128);
+-        q[blk * 32 + (j % 32)] |= (uint8_t)(val << (6 - 2 * (j / 32)));
++        const int64_t row = i / n_per_row;
++        const int64_t col = i % n_per_row;
++        uint8_t * qr = q + row * (n_per_row / 4);
++        if (col < n_full) {
++            const int64_t blk = col / 128;
++            const int     j   = (int)(col % 128);
++            qr[blk * 32 + (j % 32)] |= (uint8_t)(val << (6 - 2 * (j / 32)));
++        } else {
++            const int64_t k = col - n_full;
++            qr[n_full / 4 + k / 4] |= (uint8_t)(val << (6 - 2 * (k % 4)));
++        }
+     }
+ 
+     float * scale_ptr = (float *)(q + n / 4);
+@@ -1491,6 +1495,7 @@ static void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * v
+         }
+         
+         int sumi = hsum_i32_8(accu);
++        sumi += ggml_i2s_tail_dot(x_row, y, n);
+         s[row] = (float)sumi;
+     }
+ #else
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-i2s.c b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+index d2ea0d729..224b9514e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-i2s.c
++++ b/ggml/src/ggml-cpu/ggml-cpu-i2s.c
+@@ -3,6 +3,7 @@
+ 
+ #include "ggml-quants.h"
+ #include "ggml-cpu-impl.h"
++#include "ggml-cpu-i2s.h"
+ #include "ggml-impl.h"
+ #include "ggml.h"
+ 
+@@ -169,9 +170,18 @@ void ggml_gemm_i2_i8_s(int n, float * GGML_RESTRICT s, size_t bs, const void * G
+                     _mm_add_epi32(sum64, hi32));
+             }
+         }
++
++        // the tiles above only cover whole 128-element blocks; add the tail for these 4 rows
++        if (n % 128 != 0) {
++            for (int i = 0; i < 4; i++) {
++                for (int64_t c = 0; c < nr; c++) {
++                    s[c * bs + (r + i)] += (float)ggml_i2s_tail_dot(x + (r + i) * a_row_bytes, y + c * n, n);
++                }
++            }
++        }
+     }
+ 
+-    // Handle remaining A rows (< 4)
++    // Handle remaining A rows (< 4); ggml_vec_dot_i2_i8_s adds the tail itself
+     for (; r < nc; r++) {
+         for (int64_t c = 0; c < nr; c++) {
+             ggml_vec_dot_i2_i8_s(n, s + c * bs + r, 1,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-i2s.h b/ggml/src/ggml-cpu/ggml-cpu-i2s.h
+index a0d336021..4a7a6bf8f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-i2s.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-i2s.h
+@@ -3,6 +3,25 @@
+ 
+ #include "ggml.h"
+ 
++// Tail of an I2_S row. The kernels process a row in blocks of 128 elements (32 bytes each, the
++// layout dequantize_row_i2_s() documents). When n is not a multiple of 128, the last n % 128
++// elements are stored after those blocks, packed 4 per byte in order (first element in the high
++// bits), so a row is always n/4 bytes. The SIMD loops only see the full blocks (nb = n / 128);
++// this adds the tail. Codes are 0, 1, 2 (-1, 0, +1), like the SIMD path, and the caller subtracts
++// the activation sum afterwards.
++static inline int32_t ggml_i2s_tail_dot(const uint8_t * x_row, const int8_t * y, int64_t n) {
++    const int64_t t = n % 128;
++    int32_t sum = 0;
++    if (t != 0) {
++        const uint8_t * xt = x_row + (n - t) / 4;
++        const int8_t  * yt = y + (n - t);
++        for (int64_t k = 0; k < t; k++) {
++            sum += (int32_t)((xt[k >> 2] >> (6 - 2 * (k & 3))) & 3) * yt[k];
++        }
++    }
++    return sum;
++}
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 0329aaca1..e7dc9bde9 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -52,6 +52,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-cpu-impl.h"
+ #include "ggml-quants.h"
++#include "ggml-cpu-i2s.h"
+ #include "simd-mappings.h"
+ 
+ #include <array>
+@@ -1483,6 +1484,8 @@ class tinyBLAS_I2S_AVX {
+                     __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+                     float dot = (float)_mm_cvtsi128_si32(
+                         _mm_add_epi32(sum64, hi32));
++                    // the loop above only covers whole 128-element blocks of the row
++                    dot += (float)ggml_i2s_tail_dot(A + (ii + r) * a_row_bytes, B + (jj + c) * ldb, k);
+                     if (act_scales) {
+                         dot = (dot - act_sums[jj + c]) * (weight_scale / act_scales[jj + c]);
+                     }
