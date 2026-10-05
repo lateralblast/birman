@@ -42,7 +42,7 @@ if hasattr(faulthandler, 'register') and hasattr(signal, 'SIGUSR1'):
 
 NDArray: TypeAlias = 'np.ndarray[Any, Any]'
 
-ARCH = gguf.MODEL_ARCH.BITNET_25
+ARCH = gguf.MODEL_ARCH.BITNET_B158
 
 DEFAULT_CONCURRENCY = 16
 

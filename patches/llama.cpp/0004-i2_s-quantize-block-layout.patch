@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 603f51c54..6ec673d92 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1365,6 +1365,11 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+         if (v > max) { max = v; break; }  // first nonzero abs as scale (BitNet convention)
+     }
+ 
++    // Same layout as dequantize_row_i2_s() and the I2_S dot-product kernels:
++    // blocks of 128 elements packed into 32 bytes, where element j of a block goes
++    // to byte (j % 32) at bit position 6 - 2 * (j / 32).
++    GGML_ASSERT(n % 128 == 0);
++
+     uint8_t * q = (uint8_t *)dst;
+     memset(q, 0, n / 4);
+ 
+@@ -1375,9 +1380,9 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
+         } else {
+             val = ((double)src[i] * max > 0) ? 2 : 0; // maps to +1 or -1
+         }
+-        int byte_idx = i / 4;
+-        int bit_pos = 6 - 2 * (i % 4);
+-        q[byte_idx] |= (val << bit_pos);
++        const int64_t blk = i / 128;
++        const int     j   = (int)(i % 128);
++        q[blk * 32 + (j % 32)] |= (uint8_t)(val << (6 - 2 * (j / 32)));
+     }
+ 
+     float * scale_ptr = (float *)(q + n / 4);

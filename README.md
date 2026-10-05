@@ -5,6 +5,7 @@
 >
 > **What changed**
 > - `patches/llama.cpp/0002-requirements-numpy-2.patch` relaxes the submodule's numpy pin to `numpy>=2.0`.
+> - `patches/llama.cpp/0003-llama-quantize-i2_s.patch` (upstream commit `cea12e83f`) registers `I2_S` in `llama-quantize`, and `0004-i2_s-quantize-block-layout.patch` makes the I2_S quantizer write the layout the kernels and `dequantize_row_i2_s` read (128-element blocks packed into 32 bytes). Before `0004` it packed sequentially, so any model quantized locally produced garbage. `utils/convert-ms-to-gguf-bitnet.py` now targets `MODEL_ARCH.BITNET_B158`; the old `BITNET_25` has no name in the fork's `gguf-py` and no C++ implementation.
 > - `patches/llama.cpp/0001-bitnet-b158-squared-relu-ffn.patch` fixes the `bitnet-b1.58` graph, which reused the 3B model's SiLU FFN instead of squared ReLU. This was the cause of the bad output.
 > - The submodule is a fork we can't push to, so fixes are kept as patches and applied idempotently by `setup_env.py` (`apply_patches()`).
 > - `build.sh` runs the whole sequence: submodule init, patches, venv and requirements, model download, `setup_env.py`.
@@ -18,9 +19,9 @@
 > **Remaining issues**
 > - Only the case above was tested. Not tested: ARM, Windows/macOS, TL1/TL2 kernels, the Falcon, Falcon-E, Llama3-8B and bitnet_b1_58 models, the embedding models, and the `utils/test_*` scripts.
 > - The 2B-4T chat model doesn't reliably emit an end-of-turn token, so `run_inference.py` stops on a `Human:` reverse prompt. `run_inference_server.py` uses the same corrected chat template, but the server has no equivalent option: clients of `/v1/chat/completions` should send `"stop": ["Human:"]`, otherwise multi-turn replies can run on into invented `Human:` turns. In `run_inference_server.py`, `-p` is passed to `llama-server` as `-p` (upstream behaviour) and is not a system prompt; send system messages in the request.
-> - The pinned submodule's `llama-quantize` has no `I2_S` entry, so the f32 to I2_S step in `setup_env.py` fails. Use a pre-quantized `-gguf` model (a fix exists upstream in `cea12e83f`, not applied here).
+> - HF checkpoint to I2_S conversion was tested only via the README's safetensors route (`utils/convert-helper-bitnet.py` on `microsoft/bitnet-b1.58-2B-4T-bf16`). The result generates correct text, and 95-99% of its packed weight bytes match the official GGUF (the rest are ternary rounding differences from the bf16 weights). The helper does not quantize the embedding to F16 as the official GGUF does (it stays Q6_K) and writes EOS id 128009 rather than 128001. The `setup_env.py --hf-repo` route (`convert-hf-to-gguf-bitnet.py` then `llama-quantize`) was not run. The ARM kernels use a different `QK_I2_S` (64); the new packing assumes 128, as `dequantize_row_i2_s` does, and is untested on ARM.
 > - On a fresh clone `pip install -r requirements.txt` still hits the old pin, because it runs before `setup_env.py` can patch it. Use `./build.sh`, or Python 3.10-3.12.
-> - The `gguf` Python package from PyPI lacks the BitNet enums; the `utils/convert-*` scripts need `PYTHONPATH=3rdparty/llama.cpp/gguf-py`.
+> - The `gguf` Python package from PyPI lacks the BitNet enums. `setup_env.py` (and so `build.sh`) installs the fork's `3rdparty/llama.cpp/gguf-py` into the venv, which fixes this; running the `utils/convert-*` scripts any other way needs `PYTHONPATH=3rdparty/llama.cpp/gguf-py`.
 > - The `patches/` directory is a workaround; the real fix belongs in the llama.cpp fork the submodule points at.
 > - `setup_env.py` rewrites the tracked file `include/bitnet-lut-kernels.h` on every run.
 > - A `-cnv` reply may run on past the end of the answer for longer responses.
