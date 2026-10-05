@@ -137,6 +137,19 @@
 >
 > Against the 8-thread, default-placement Xeon table above, that is 2.9-3.6x the prompt throughput and 1.6-2.6x the generation speed, depending on the model; against the i9-9900 it is 1.9-2.8x on prompt processing and 1.6-2.7x on generation. The prompt-processing numbers vary by 7-21% between repeats (the `+/-`); generation is steady.
 >
+> **Does the Xeon build use everything the CPU has? Yes, and nothing else helped.** The build is `Release` (`-O3`) with `-march=native`, and llama.cpp reports `AVX2 = 1, FMA = 1, F16C = 1, BMI2 = 1` at startup (the I2_S kernels contain AVX2 `ymm` instructions); a Broadwell has no AVX-512 or VNNI, so there is nothing more at the instruction level. Alternatives were built or run beside it and benchmarked at 32 threads with `--numa distribute`, the cache warmed under each variant, three interleaved repeats for the build variants (pp512 / tg128 against the current build):
+>
+> | Variant | Result |
+> |---|---|
+> | LTO (`-DGGML_LTO=ON`) | mixed: prompt +5% (large), +11% (2B-4T), +3% (3B), -8% (Llama3-8B); generation -2% to +6% |
+> | OpenMP through `libgomp` (clang has no `libomp` here, so the default build silently runs without OpenMP; `omp.h` copied from GCC) | about 10x slower: 2B-4T 18.8 / 6.2 against 470 / 58, Llama3-8B 6.1 / 2.9 |
+> | larger micro-batch (`-ub 1024`, `-ub 2048 -b 2048`) | prompt -9%, generation unchanged |
+> | flash attention (`-fa 1`) | no change |
+> | no mmap (`-mmp 0`) | generation -9% (it loses the first-touch placement `--numa distribute` relies on) |
+> | no mmap plus glibc transparent hugepages (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`) | generation -21% |
+>
+> So the default build and the default flags stay. Why the `libgomp` build is so slow was not investigated.
+>
 > **GEMM kernel, `utils/test_gemm_kernel.sh -i 500`** (single-threaded, n = 2048 unless noted): 60 GFLOPS for one token (0.14 ms), 81-87 GFLOPS for 128 to 2048 tokens, 101 GFLOPS for the 8192-wide `ffn_down` case, against 150-207 on the i9-9900 (5.0 GHz turbo).
 >
 > **Power, `utils/test_power.sh`, BitNet-2B-4T, Intel RAPL (both packages and both DRAM zones, via `sudo`):** at 8 threads prompt processing 133.4 t/s at 115.7 W (DRAM 47.6 W), 0.87 J/token, and generation 23.8 t/s at 118.9 W (DRAM 62.1 W), 4.99 J/token; at 32 threads 466.8 t/s at 195.0 W (0.42 J/token) and 31.9 t/s at 183.3 W (5.75 J/token). The sockets draw about 115 W with only 8 threads busy, so the extra threads are cheap for prompt processing and, with the default placement, a net loss for generation. With the new defaults (`-t 32 --numa distribute`, cache warmed under the pinned threads) the same test gives prompt processing 501.4 t/s at 197.0 W (DRAM 56.8 W), 0.39 J/token, and generation 60.2 t/s at 196.4 W (DRAM 82.3 W), 3.26 J/token: generation uses 43% less energy per token than the default placement (5.75 J), still above the i9-9900's 2.79 J/token (package power only; the Xeon figure covers two sockets).

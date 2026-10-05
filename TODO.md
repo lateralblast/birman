@@ -34,6 +34,12 @@ described in the notice at the top of `README.md`.
 - [ ] `run_inference_server.py` was only smoke-tested with the flag (starts, answers, 44.5 t/s on 2B-4T), not
   benchmarked under load.
 
+## Build
+
+- [ ] OpenMP built with clang against GCC's `libgomp` was about 10x slower on the Xeon (2B-4T pp512 18.8 t/s against
+  470); not investigated. The default build requests OpenMP, but with no `libomp` installed CMake silently builds
+  without it, which is the fast configuration. LTO was mixed (+11% prompt on 2B-4T, -8% on Llama3-8B), so it was not adopted.
+
 ## Untested
 
 - [ ] ARM, Windows and macOS builds and runs. The ARM scalar path was only tested as an x86 build without AVX2,
