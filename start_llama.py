@@ -17,6 +17,15 @@ It inspects the machine and adds what the measurements in the README support:
   -ngl 0            CPU only.
   --chat-template-file   the 2B-4T chat template, for the 2B-4T model when running the server or cli.
 
+-m also takes a name instead of a path: every word (case and punctuation ignored) must occur in the model's
+directory or file name, e.g. -m falcon, -m "falcon 7b", -m 2b-4t, -m llama; the candidates that match are ranked and
+probed as below, so the best-fitting match is used. --largest (= --prefer largest) ranks by parameter count only:
+--largest -m falcon is the largest Falcon, --largest alone the largest model of all.
+A name that matches nothing under models/ is looked up in the catalogue of installable models (model_fetch.py:
+setup_env.py's list plus the embedding models) and downloaded and built, unless --no-fetch; the user is asked first only
+when the model does not look suitable (RAM, swap, disk, estimated speed); --yes answers that question, --check only
+reports the plan.
+
 Without -m it also chooses the model (model_picker.py): the canonical GGUFs under models/ that fit in the available
 memory (a cgroup limit counts), tried best first - chat-capable models, then more parameters; --prefer largest ignores
 the chat preference - and the first whose measured generation speed (a few-second llama-bench probe run with the
@@ -53,6 +62,7 @@ try:
         VERSION = _f.read().strip()
 except OSError:
     VERSION = "unknown"
+import model_fetch as fetch
 import model_picker as picker  # noqa: E402
 import numa_distribute as numa  # noqa: E402
 
@@ -423,7 +433,7 @@ def parse(argv):
                                 allow_abbrev=False)
     p.add_argument("--version", action="version", version="start_llama.py " + VERSION)
     p.add_argument("--tool", choices=sorted(TOOLS), default="server", help="which binary to run (default: server)")
-    p.add_argument("-m", "--model", help="path to the GGUF model (default: choose the best one for this machine from models/)")
+    p.add_argument("-m", "--model", help="path to a GGUF model, or a name to look for under models/ (e.g. falcon, \"falcon 7b\", 2b-4t: every word must occur in the directory/file name; the best match for this machine is used, see --largest). Default: choose the best model for this machine from models/")
     p.add_argument("-t", "--threads", type=int, help="thread count (default: physical cores this process may use)")
     p.add_argument("--check", "--dry-run", dest="check", action="store_true", help="report the machine and the command, run nothing")
     p.add_argument("--no-numa", action="store_true", help="do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
@@ -436,6 +446,10 @@ def parse(argv):
     g = p.add_mutually_exclusive_group()
     g.add_argument("--local", action="store_true", help="server: listen on localhost only (127.0.0.1; llama-server's own default)")
     g.add_argument("--open", action="store_true", help="server: listen on all interfaces (0.0.0.0) so other machines can reach the API; combine with --api-key KEY")
+    p.add_argument("--embedding", action="store_true", help="server for text embeddings (RAG retrieval): uses an embedding model from models/ (the 0.6B one first), adds --embedding and -b/-ub 2048, and listens on port 8081 unless --port is given; works with --local/--open")
+    p.add_argument("--largest", action="store_true", help="same as --prefer largest: choose the model with the most parameters (that fits and is fast enough); combine with -m NAME to pick the largest match")
+    p.add_argument("--no-fetch", action="store_true", help="with -m NAME: never download a model that is not under models/ (the default is to fetch and build it, asking first only when it does not look suitable for this machine)")
+    p.add_argument("--yes", "-y", action="store_true", help="answer yes to the question asked before fetching a model that does not look suitable")
     p.add_argument("--close", action="store_true", help="remove the firewall rules a previous --open run added, then exit (they are also removed when the server exits)")
     p.add_argument("--no-firewall", action="store_true", help="with --open: do not add a firewall rule for the server port (ufw/firewalld)")
     p.add_argument("--bin-dir", default=os.path.join(ROOT, "build", "bin"), help="directory with the llama binaries")
@@ -447,7 +461,7 @@ def parse(argv):
     return args, rest
 
 
-def choose_model(args, m, threads):
+def choose_model(args, m, threads, pattern=None):
     """Pick a model from models/ for this machine (see model_picker.py). Returns (candidate or None, evicted paths)."""
     cands = []
     for path in picker.find_models(args.models_dir):
@@ -458,6 +472,12 @@ def choose_model(args, m, threads):
     if not cands:
         print("  no models found under %s (run ./build.sh, or pass -m MODEL.gguf)" % args.models_dir, file=sys.stderr)
         return None, set()
+    if pattern:
+        found = [c for c in cands if picker.matches(c["path"], pattern)]
+        if not found:
+            print("  no model matches %r; available: %s" % (pattern, ", ".join(sorted(c["label"] for c in cands))), file=sys.stderr)
+            return None, set()
+        cands = found
     mem = int(m["mem_avail_gb"] * 1073741824)
     if mem <= 0:  # not readable on this OS (no /proc/meminfo): do not conclude that nothing fits
         print("  available memory could not be read on this system: memory fit is not checked", file=sys.stderr)
@@ -492,10 +512,98 @@ def choose_model(args, m, threads):
     return chosen, evicted
 
 
+def local_bytes_per_s(args, m, threads):
+    """Memory-bound generation speed of this machine in bytes/s (t/s x file size) from a cached or quick probe of the
+    largest model already under models/, or None."""
+    bench = os.path.join(args.bin_dir, TOOLS["bench"])
+    if not os.path.isfile(bench):
+        return None
+    best = None
+    for path in picker.find_models(args.models_dir):
+        try:
+            c = picker.describe(path)
+        except (OSError, ValueError):
+            continue
+        if best is None or c["size"] > best["size"]:
+            best = c
+    if best is None:
+        return None
+    numa_extra, _r = numa.explain([], not args.no_numa)
+    key = "%s|%d|%d|%d" % (m["cpu"], m["cores"], m["sockets"], m["numa_nodes"])
+    tps, _cached = picker.probe_tps(bench, best["path"], threads, numa_extra, key, use_cache=not args.reprobe)
+    return tps * best["size"] if tps else None
+
+
+def fetch_missing(args, m, threads, pattern):
+    """No model under models/ matches `pattern`: find it in the catalogue, judge it for this machine, ask when it does
+    not look suitable, then download and build it. Returns True when it was installed."""
+    entries = fetch.catalogue(args.embedding)
+    hits = fetch.find(pattern, entries, args.prefer)
+    if not hits:
+        print("  %r is not under %s and not in the catalogue of installable models (%s)"
+              % (pattern, args.models_dir, ", ".join(sorted(e["name"] for e in entries)) or "empty"), file=sys.stderr)
+        return False
+    bps = local_bytes_per_s(args, m, threads) if not args.embedding else None
+    judged = [(e,) + fetch.judge(e, m, args.models_dir, args.min_tps, bps) for e in hits]
+    e, problems, notes = next((j for j in judged if not j[1]), judged[0])  # best match that looks suitable, else the best match
+    sz = fetch.sizes(e)
+    print("Not installed: %r matches %s (%s, %s B parameters). %s" % (
+        pattern, e["name"], e["repo"], "%.2f" % e["params"] if e["params"] else "?",
+        "(%d catalogue models match; %s)" % (len(hits), "the best one that looks suitable" if not problems else "none looks suitable, so the best match") if len(hits) > 1 else ""), file=sys.stderr)
+    if sz:
+        print("  will %s: about %.0f GB download, %.1f GiB on disk when done%s" % (
+            "download the GGUF" if e["kind"] == "embedding" else "download, convert to I2_S and build",
+            sz["download"] * 1.074, sz["final"], "" if e["kind"] == "embedding" else ", about %.0f GiB of memory at peak" % sz["peak"]), file=sys.stderr)
+    for n in notes:
+        print("  note: " + n, file=sys.stderr)
+    if args.check:
+        for pr in problems:
+            print("  would ask first - not suitable: " + pr, file=sys.stderr)
+        print("  --check: nothing downloaded", file=sys.stderr)
+        return False
+    if problems:
+        print("  This model does not look suitable for this machine:", file=sys.stderr)
+        for pr in problems:
+            print("   - " + pr, file=sys.stderr)
+        if not fetch.confirm("  Download and build it anyway?", args.yes):
+            print("  not fetched", file=sys.stderr)
+            return False
+    return fetch.install(e, args.models_dir)
+
+
 def main(argv=None):
     args, passthrough = parse(sys.argv[1:] if argv is None else argv)
+    if args.largest:
+        args.prefer = "largest"
     if args.close:
         return close_firewall(args.check)
+    if args.embedding:
+        if args.tool != "server":
+            print("error: --embedding only applies to --tool server", file=sys.stderr)
+            return 2
+        passthrough = ["--embedding"] + passthrough
+        if not has_flag(passthrough, "--port", "-p"):
+            passthrough += ["--port", "8081"]
+        for flag, names in (("-b", ("-b", "--batch-size")), ("-ub", ("-ub", "--ubatch-size"))):
+            if not has_flag(passthrough, *names):
+                passthrough += [flag, "2048"]
+        if args.model and not os.path.exists(args.model) and not args.model.lower().endswith(".gguf") and os.sep not in args.model:
+            wanted = args.model
+            found = [x for x in picker.find_embedding_models(args.models_dir) if picker.matches(x, wanted)]
+            if not found:
+                print("error: no embedding model matches %r" % wanted, file=sys.stderr)
+                return 2
+            args.model = None
+        else:
+            found = None
+        if not args.model:
+            found = found if found is not None else picker.find_embedding_models(args.models_dir)
+            if not found:
+                print("error: no embedding model under %s (download microsoft/BitNet-embedding-0.6B there, see "
+                      "docs/bitnet-embeddings-i2s-guide.md), or pass -m" % args.models_dir, file=sys.stderr)
+                return 2
+            args.model = found[0]
+            print("Embedding model: %s (of %d found)" % (found[0], len(found)), file=sys.stderr)
     fw_added = False
     m = detect()
     threads = args.threads if args.threads else m["threads"]
@@ -507,10 +615,18 @@ def main(argv=None):
         print("  cgroup CPU limit: %.1f CPUs" % m["cgroup_limit"], file=sys.stderr)
 
     evicted = set()
+    pattern = None
+    if args.model and not os.path.exists(args.model) and not args.model.lower().endswith(".gguf") and not os.sep in args.model:
+        pattern, args.model = args.model, None  # a name, not a path: look it up under models/
     if not args.model:
-        chosen, evicted = choose_model(args, m, threads)
+        chosen, evicted = choose_model(args, m, threads, pattern)
+        if chosen is None and pattern and not args.no_fetch:
+            if fetch_missing(args, m, threads, pattern):
+                chosen, evicted = choose_model(args, m, threads, pattern)
         if chosen:
             args.model = chosen["path"]
+        elif pattern:
+            return 2
 
     model_bytes = os.path.getsize(args.model) if args.model and os.path.isfile(args.model) else 0
     for w in warnings_for(m, model_bytes):

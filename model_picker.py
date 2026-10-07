@@ -163,6 +163,29 @@ def find_models(models_dir):
     return out
 
 
+def find_embedding_models(models_dir):
+    """GGUF files of embedding models (a directory with "embed" in its name, I2_S file), largest first: the 0.6B
+    model before the 270M one. These are not chat models and are never chosen by find_models()/select()."""
+    out = []
+    for root, _dirs, files in os.walk(models_dir):
+        if "embed" not in os.path.basename(root).lower():
+            continue
+        out += [os.path.join(root, n) for n in files if n.endswith(".gguf") and "i2_s" in n.lower()]
+    return sorted(out, key=lambda x: (-os.path.getsize(x), x))
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def matches(path, pattern):
+    """True when every word of pattern (split on spaces/commas, case and punctuation ignored) occurs in the model's
+    directory name or file name: "falcon", "falcon 7b", "falcon3-7b", "2b-4t" all work."""
+    hay = _norm(os.path.basename(os.path.dirname(path)) + os.path.basename(path))
+    words = [_norm(w) for w in re.split(r"[\s,]+", pattern) if _norm(w)]
+    return bool(words) and all(w in hay for w in words)
+
+
 def describe(path, cache=None):
     """Dict with name, params, size and chat for a model file (header parsed once, then cached)."""
     cache = _load_cache() if cache is None else cache

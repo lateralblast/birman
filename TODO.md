@@ -61,6 +61,22 @@ and the macOS thread/memory detection in `start_llama.py`.
   stand-in command, not an enabled ufw/firewalld (neither is enabled on the i9 or the Xeon). Plain iptables/nftables
   are not handled.
 
+## RAG
+
+- [ ] Retrieval quality of `bitnet-embedding-0.6b` (I2_S) was only checked with a few toy questions and a crude keyword
+  test on this repo's README (top-4 recall about 2/7). Not compared with the f16 GGUF or another embedder, and the MTEB
+  numbers were not reproduced. Untested: the 270M model, reranking, other chunking.
+- [ ] The 2B-4T chat model often ignores or misreads retrieved context; a larger or instruct-tuned model was not tried
+  for RAG.
+
+## Fetching models
+
+- [ ] `model_fetch.py` estimates (file size, download, conversion peak, speed from file size) are fitted to a handful of
+  models; Falcon-E 3B, Falcon3 3B/10B and the base variants were not converted here. The embedding download path
+  (`huggingface-cli download microsoft/BitNet-embedding-*`) was not run through `start_llama.py`. `setup_env.py` rebuilds
+  the binaries and rewrites the tracked `include/kernel_config.ini` on every fetch. A name only fetches when nothing
+  local matches it.
+
 ## Build
 
 - [ ] OpenMP built with clang against GCC's `libgomp` was about 10x slower on the Xeon (2B-4T pp512 18.8 t/s against
@@ -70,7 +86,7 @@ and the macOS thread/memory detection in `start_llama.py`.
 ## Model selection
 
 - [ ] `model_picker.py` ranks by "chat-capable (name heuristic), then parameter count"; parameter count is only a
-  proxy for quality and nothing here measures answer quality, so the default pick (BitNet-2B-4T on both machines) is
+  proxy for quality and nothing here measures answer quality, so the default pick (BitNet-2B-4T on the i9 and M1 Max, Falcon3-7B-Instruct on the Xeon, where it is the largest chat model that clears 10 t/s) is
   a policy, not a benchmark result. A quality score per model (a downstream task, not perplexity, which is not
   comparable across tokenizers) would let it choose better, for example whether Llama3-8B beats 2B-4T for chat.
 - [ ] The speed probe depends on the load at the time and, on multi-socket machines, on where the model's pages sit

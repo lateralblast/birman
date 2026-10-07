@@ -21,6 +21,8 @@
 python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -p "You are a helpful assistant" -cnv
 ./start_llama.py                               # server with the best model for this machine (--check previews it)
 ./start_llama.py --tool cli -m MODEL.gguf -p "Hello"     # any other llama.cpp binary
+./start_llama.py -m falcon --largest            # name instead of path: the largest model whose name contains "falcon"
+./start_llama.py -m falcon3-10b                 # not installed? looked up, judged for this machine (asks first if unsuitable), downloaded and built
 ./start_llama.py --local                        # server on 127.0.0.1 only (llama-server's default)
 ./start_llama.py --open --api-key KEY          # server on 0.0.0.0; with no key given, one is generated, saved to ~/.cache/start_llama/api_key (0600) and printed
                                                # (also opens the port in ufw/firewalld if enabled; --no-firewall skips)
@@ -65,6 +67,8 @@ The submodule is a fork that cannot be pushed to, so fixes are kept as patches i
   - adds `--numa distribute` on multi-node Linux machines (`numa_distribute.py`; `--no-numa`, `--numa-evict`; see [NUMA placement](#numa-placement));
   - adds `-ngl 0` and, for the 2B-4T model on the server or cli, its chat template;
   - warns when an x86 CPU has no AVX2 (the scalar fallback runs) or when the model does not fit in free RAM (on macOS read from `sysctl hw.memsize` and `vm_stat`);
+  - **`-m` accepts a name as well as a path:** every word (case and punctuation ignored) must occur in the model's directory or file name, so `-m falcon`, `-m "falcon 7b"`, `-m 2b-4t` or `-m llama` find the model under `models/`. Several matches are ranked and probed like the automatic choice (memory fit, then measured speed), so you get the best match that fits; with `--embedding`, `-m 270m` picks the 270M embedding model. No match lists what is available. **`--largest`** (same as `--prefer largest`) ranks by parameter count only, ignoring the chat preference: `--largest -m falcon` is the largest Falcon model, `--largest` alone the largest model of all. On the Xeon, `-m falcon` and `--largest -m falcon` both give Falcon3-7B-Instruct (7.46 B; the chat preference only changes the order when a base model is among the matches);
+  - **fetches a model that is not installed:** when `-m NAME` matches nothing under `models/`, the name is looked up in a catalogue (`model_fetch.py`: the Hugging Face models `setup_env.py` supports, plus the two BitNet embedding models with `--embedding`; `-m falcon-e-3b`, `-m "falcon3 10b"`) and the best match is downloaded and built: `setup_env.py -hr REPO -q i2_s -md MODELS_DIR` for the conversion models (the f32 intermediate is deleted afterwards), `huggingface-cli download` for the embedding GGUFs. Before downloading it judges the model for this machine from estimates (about 0.38 GiB of I2_S file, 2 GB of download and 4.5 GiB of peak conversion memory per billion parameters, free RAM + swap, free disk, and a generation speed estimated from the speed measured on a local model, since a memory-bound model's speed scales with its file size) and, **only if it does not look suitable, asks `[y/N]` first** and explains why; without a terminal it refuses unless `--yes` is given. `--no-fetch` never downloads, `--check` prints the plan and the questions it would ask without fetching. Tested with a real fetch of Falcon-E-1B-Base into an empty directory (1.7 B: downloaded, converted, 0.55 GiB I2_S file, benchmarked at 41.6 t/s with 8 threads on the i9; the 12 GiB-disk check refused it on a 7 GiB tmpfs and asked first, and with a disk with room it went ahead without asking); `--check` on larger models (Falcon3-10B asks first: 46 GiB conversion peak against 16.5 GiB RAM + 10 GiB swap here, estimated 7 t/s). Not run for the embedding models, and `-m NAME` only fetches when *nothing* local matches (`-m falcon` with any Falcon installed uses that one);
   - **without `-m` chooses the model for the machine** (`model_picker.py`; see [Model selection](#model-selection)): `--prefer largest`, `--min-tps N`, `--no-probe`, `--reprobe`, `--models-dir`;
   - **network access (server only):** by default `llama-server` listens on `127.0.0.1`; `--local` says so explicitly, `--open` listens on `0.0.0.0`. With `--open` and no key it generates one (`secrets.token_urlsafe`), stores it in `~/.cache/start_llama/api_key` (0600, or the file given with `--api-key-file`; reused on later starts), prints it and starts the server with `--api-key-file`; clients send `Authorization: Bearer <key>` (`/health` and `/v1/models` stay public, as in llama-server). If ufw or firewalld is enabled it also opens the port (`sudo -n`; firewalld runtime-only), records only a rule it added itself in `~/.cache/start_llama/firewall.json`, and removes it when the server exits (the server then runs as a child process; Ctrl-C/SIGTERM are forwarded). `--close` removes recorded rules after an unclean exit (SIGKILL, crash), `--no-firewall` skips the step; plain iptables/nftables are not touched. `--local`/`--open` conflict with each other and with `--host`; `--check` shows the plan without changing anything. Tested with a stand-in firewall command and against a real `--open` server (Xeon, 19/19 checks over the LAN with the key); not yet run against an enabled ufw or firewalld;
   - passes everything it does not recognise to the llama binary unchanged, and never overrides a flag you give yourself (`-ngl`, `--numa`, `--chat-template-file`).
@@ -305,9 +309,66 @@ The policy: take the canonical quantized models under `models/` (`ggml-model-{i2
 | i9-9900 limited to 4 cores / 2 cores | BitNet-2B-4T | 13.4 / 11.3 t/s |
 | i9-9900 limited to 1 core | Falcon-E-1B-Instruct | 2B-4T measured 8.1 (below 10); Falcon-E 15.8 |
 | i9-9900, `--min-tps 30` | Falcon-E-1B-Instruct | 2B-4T measured 17.6 (below 30); Falcon-E 43.6 |
-| 2 x Xeon, default policy | BitNet-2B-4T | 32.3 t/s (53.4 after `--numa-evict`) |
+| 2 x Xeon, default policy (before Falcon3-7B was added) | BitNet-2B-4T | 32.3 t/s (53.4 after `--numa-evict`) |
+| 2 x Xeon, default policy (with Falcon3-7B-Instruct, 2026-10-07) | Falcon3-7B-Instruct-1.58bit | the largest chat-capable model; measured 37.0 t/s with `-p 512 -n 128` after `--numa-evict` (21.6 unplaced), above the 10 t/s minimum. Pass `-m` for 2B-4T (60-69 t/s) |
 | 2 x Xeon, `--prefer largest` | Llama3-8B | 19.2 t/s, so the bigger machine gets the bigger model |
 | available memory 64 GB / 4 GB / 1.6 GB / 1.0 GB / 0.4 GB (simulated) | 2B-4T / 2B-4T / Falcon-E-1B / bitnet_b1_58-large / nothing fits | memory fit alone |
+
+### Retrieval-augmented generation (RAG)
+
+RAG needs two models: an embedding model to find the relevant text and a chat model to answer from it. The repo has both halves:
+
+```bash
+# once: the I2_S embedding model (Hugging Face repo microsoft/BitNet-embedding-0.6B contains the ready GGUF)
+huggingface-cli download microsoft/BitNet-embedding-0.6B --local-dir models/bitnet-embedding-0.6b
+./start_llama.py --open                       # chat model, port 8080 (key generated, see Launching)
+./start_llama.py --embedding --open           # embedding server, port 8081, same key file
+python utils/rag_demo.py --docs README.md docs/ --host SERVER --api-key-file KEYFILE "How is the API key stored?"
+```
+
+`--embedding` runs `llama-server --embedding` with the 0.6B embedding model from `models/` (the 270M one if that is all there is; `-m` to choose), `-b/-ub 2048` and port 8081 unless `--port` is given; `--local`, `--open`, the key and the firewall handling work as for the chat server. It serves `/v1/embeddings`: 1024-dimension, L2-normalised vectors for the 0.6B model (640 for the 270M). The model card says to give *queries* the instruction `Instruct: <task>\nQuery: <question>` and documents nothing.
+
+`utils/rag_demo.py` (standard library only) is a minimal end-to-end example: it splits files into chunks, embeds them (vectors are cached in `~/.cache/start_llama/rag_vectors.json`), embeds the question, takes the `--top-k` most similar chunks by cosine similarity and asks the chat server to answer from them. It keeps the index in memory; use a vector store for anything large.
+
+Measured on the 2-socket Xeon (32 threads, `--numa distribute`), 0.6B I2_S model over the LAN: about 700 tokens/s of embedding throughput (16 chunks of ~900 characters in 4.8 s, one chunk in 0.3 s); a batch gives the same vector as the text alone (cosine 0.9997); an unauthenticated request gets 401. **Quality is only lightly checked:** 4 of 5 toy questions matched the right sentence, but on this README as a corpus (long, dense bullets) the right passage was in the top 4 for only about 2 of 7 questions and in the top 8 for about 5 of 7 (crude keyword check; chunk sizes of 300-800 characters made no clear difference), and the 2.4B chat model often answered "the context does not contain the answer" even when it did, or answered from its own knowledge. Treat it as a working pipeline, not a tuned one: a cleaner corpus, a cross-encoder reranker, or a larger chat model would be the next steps. The MTEB table in `docs/bitnet-embeddings-i2s-guide.md` was not reproduced.
+
+### A larger instruct model: Falcon3-7B-Instruct-1.58bit
+
+`python setup_env.py -hr tiiuae/Falcon3-7B-Instruct-1.58bit -q i2_s` (on the Xeon: the download is 13 GB, the f32 intermediate 29.8 GB, the final I2_S file 2.61 GiB, 7.46 B parameters; about 5 minutes). It is the largest instruction-tuned model that bitnet.cpp supports here, but it is a post-training-quantized Falcon3, not a natively trained BitNet (no natively trained BitNet larger than 2B-4T has been published as far as a web search found). On the 2-socket Xeon, 32 threads, `--numa distribute`, `llama-bench` t/s: pp512 153-163, tg128 **37.0 after `--numa-evict`** (21.6 on a cache that was not placed), against Llama3-8B at 33.3 and 2B-4T at 60-69. Sanity checks: it answers "Paris" and "Canberra", writes a correct recursive Fibonacci function and solves the 60 km in 45 minutes problem (80 km/h) with a worked answer. In the RAG demo (above) it answered the repo questions wrongly and confidently (it was given passages the 0.6B embedder did not retrieve), so there the retriever, not the generator, was the limit. Perplexity: 10.97 +/- 0.27 on the WikiText-2 slice, and I2_S loses 0.7% against the f32 GGUF it came from (see [Accuracy](#accuracy)). The f32 file `ggml-model-f32.gguf` stays in the model directory after conversion (29.8 GB); `utils/cleanup_stale_models.sh` does not know about it yet.
+
+### Listing the models on a machine
+
+Which models `start_llama.py` can see, and which one it would start, without running anything (`--no-probe` skips the speed measurement; leave it out to include the measured t/s):
+
+```bash
+./start_llama.py --check --no-probe                 # on the machine itself, or: ssh user@server 'cd ~/code/birman && ./start_llama.py --check --no-probe'
+find models -name '*.gguf' -printf '%s %p\n' | sort -k2    # every file, with its size in bytes
+curl http://SERVER:8080/v1/models                    # what a running server has loaded (public endpoint, no key needed)
+```
+
+Example output on the 2-socket Xeon (the server address is left out; `--check` runs nothing). Ranked best first; the model it chose is marked `<-- chosen`, and the ones below were not tried because a higher-ranked one was chosen:
+
+```
+  Falcon3-7B-Instruct-1.58bit     7.46 B   2.61 GiB  chat  fits (speed not measured)   <-- chosen
+  BitNet-b1.58-2B-4T              2.41 B   0.82 GiB  chat  not tried (a higher-ranked model was chosen)
+  Falcon-E-1B-Instruct            1.72 B   0.55 GiB  chat  not tried (a higher-ranked model was chosen)
+  Falcon3-1B-Instruct-1.58bit     1.67 B   0.97 GiB  chat  not tried (a higher-ranked model was chosen)
+  Llama3-8B-1.58-100B-tokens      8.03 B   3.01 GiB        not tried (a higher-ranked model was chosen)
+  bitnet_b1_58-3B                 3.32 B   0.85 GiB        not tried (a higher-ranked model was chosen)
+  bitnet_b1_58-large              0.73 B   0.21 GiB        not tried (a higher-ranked model was chosen)
+```
+
+| Model | Params | File the picker uses | Chat-capable |
+|---|---|---|---|
+| Falcon3-7B-Instruct-1.58bit | 7.46 B | `ggml-model-i2_s.gguf`, 2.61 GiB | yes |
+| BitNet-b1.58-2B-4T | 2.41 B | `ggml-model-i2_s-q8emb.gguf`, 0.82 GiB | yes |
+| Falcon-E-1B-Instruct | 1.72 B | `ggml-model-i2_s.gguf`, 0.55 GiB | yes |
+| Falcon3-1B-Instruct-1.58bit | 1.67 B | `ggml-model-i2_s-f16emb.gguf`, 0.97 GiB | yes |
+| Llama3-8B-1.58-100B-tokens | 8.03 B | `ggml-model-i2_s.gguf`, 3.01 GiB | no (base model) |
+| bitnet_b1_58-3B | 3.32 B | `ggml-model-i2_s-q8emb.gguf`, 0.85 GiB | no (base model) |
+| bitnet_b1_58-large | 0.73 B | `ggml-model-i2_s-q8emb.gguf`, 0.21 GiB | no (base model) |
+
+(The Xeon's `models/` also holds the 29.8 GB f32 intermediate of Falcon3-7B, which the picker ignores.) The `models/` directories also hold the plain `ggml-model-i2_s.gguf` next to the `-q8emb`/`-f16emb` files (the picker prefers the latter). A server loads one model at a time: to serve another, restart with `./start_llama.py --open -m models/Llama3-8B-1.58-100B-tokens/ggml-model-i2_s.gguf`.
 
 Since `build.sh` writes a Q8_0-embedding copy of a model whose embedding is f16 or f32, `start_llama.py` now picks that file (2B-4T: 0.82 GiB instead of 1.11 GiB), which generates up to 30% faster, so the speeds in the table above, measured with the f16 files, are conservative.
 
@@ -328,6 +389,7 @@ The probe is accurate: its 16-token reading was within about 1% of a 128-token, 
 | Falcon3-1B-Instruct-1.58bit, embedding f16 | 15.36 +/- 0.40 |
 | Falcon-E-1B-Instruct, embedding f16 | 9.82 +/- 0.21 |
 | Falcon3-1B-Instruct-1.58bit, embedding I2_S (old file) | 16.44 +/- 0.43 |
+| Falcon3-7B-Instruct-1.58bit (f16 embedding; Xeon, 2026-10-07) | 10.97 +/- 0.27 |
 
 **I2_S against the f32 GGUF it came from**, `llama-perplexity -c 512` on identical leading chunks (the f32 files are the converter's output, so this measures quantization loss only):
 
@@ -338,6 +400,7 @@ The probe is accurate: its 16-token reading was within about 1% of a 128-token, 
 | Falcon3-1B (f16 embedding) | 8 | 15.997 | 16.038 | +0.3% |
 | Falcon-E-1B (f16 embedding) | 8 | 11.000 | 11.044 | +0.4% |
 | Llama3-8B | 3 | 11.336 | 11.458 | +1.1% |
+| Falcon3-7B-Instruct (Xeon) | 8 | 11.613 | 11.699 | +0.7% |
 
 All differences are well inside the standard errors (0.8-1.1 perplexity points on 3-8 chunks), so I2_S loses nothing measurable; the Llama3-8B wrong answer to "The capital of France is" is the model, not the quantization. With a tail-handling bug (before patch `0006`) bitnet_b1_58-3B scored about 7,400 on the same kind of test, so the check can see a broken kernel.
 
