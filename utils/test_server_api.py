@@ -17,6 +17,7 @@ BitNet-b1.58-2B-4T, whose chat template start_llama.py / run_inference_server.py
 much smaller or base-only model can fail them on content. Exit status 0 means every check passed.
 """
 import argparse
+import os
 import concurrent.futures as cf
 import json
 import sys
@@ -26,13 +27,23 @@ import urllib.request
 
 _ap = argparse.ArgumentParser(description="Smoke test for a running llama-server.")
 _ap.add_argument("--url", default="http://127.0.0.1:8089", help="server base URL (default: %(default)s)")
-BASE = _ap.parse_args().url.rstrip("/")
+_ap.add_argument("--api-key", default=os.environ.get("LLAMA_API_KEY"), help="API key the server was started with (default: $LLAMA_API_KEY)")
+_ap.add_argument("--api-key-file", help="file with the API key (first non-comment line)")
+_args = _ap.parse_args()
+BASE = _args.url.rstrip("/")
+KEY = _args.api_key
+if _args.api_key_file:
+    with open(_args.api_key_file) as _f:
+        KEY = next(ln.strip() for ln in _f if ln.strip() and not ln.startswith("#"))
+HEADERS = {"Content-Type": "application/json"}
+if KEY:
+    HEADERS["Authorization"] = "Bearer " + KEY
 results = []
 
 
 def req(method, path, body=None, raw_body=None, timeout=180):
     data = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else None)
-    r = urllib.request.Request(BASE + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    r = urllib.request.Request(BASE + path, data=data, method=method, headers=HEADERS)
     try:
         with urllib.request.urlopen(r, timeout=timeout) as resp:
             b = resp.read()
@@ -104,7 +115,7 @@ check("multi-turn chat remembers the name", code == 200 and "Alex" in msg, repr(
 
 # 8. streaming chat (server-sent events)
 body = {"messages": [{"role": "user", "content": "Count from one to five."}], "max_tokens": 30, "temperature": 0, "stream": True}
-r = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(), method="POST", headers={"Content-Type": "application/json"})
+r = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(), method="POST", headers=HEADERS)
 chunks, parts, done, first = 0, [], False, None
 t0 = time.time()
 with urllib.request.urlopen(r, timeout=180) as resp:
@@ -153,6 +164,17 @@ code, j = req("GET", "/no-such-route")
 check("unknown route returns 404", code == 404, str(code))
 code, j = req("POST", "/v1/chat/completions", {"messages": "not a list"})
 check("malformed chat request is rejected", code >= 400, "%s" % code)
+
+# 11b. with a key configured, a request without it must be refused
+if KEY:
+    try:
+        # /health and /v1/models are public in llama-server; a completion is not
+        urllib.request.urlopen(urllib.request.Request(BASE + "/completion", data=b'{"prompt":"hi","n_predict":1}',
+                                                      headers={"Content-Type": "application/json"}), timeout=30).close()
+        refused = 200
+    except urllib.error.HTTPError as e:
+        refused = e.code
+    check("completion request without the API key is refused (401)", refused == 401, str(refused))
 
 # 12. server still healthy after the bad requests
 code, j = req("GET", "/health")

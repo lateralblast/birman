@@ -4,8 +4,8 @@ By default the model's pages end up on one NUMA node and the threads float betwe
 limited by one node's memory bandwidth. `--numa distribute` pins the threads evenly across the nodes; each
 thread then first-touches (and so places, in local memory) the rows of the weights it always handles, and
 every read is local. On a 2-socket Xeon (see the README) it made generation 1.1-2.0x faster at every thread
-count for four models (about 2x at 32-64 threads) and usually sped up prompt processing too. The scripts that
-launch llama.cpp binaries add the flag automatically when it applies:
+count for four models (about 2x at 32-64 threads); its effect on prompt processing was inconsistent (nothing to
+1.5x). The scripts that launch llama.cpp binaries add the flag automatically when it applies:
 
   - Linux, with more than one NUMA node that has CPUs (nodes that only have memory do not count);
   - the command does not already contain --numa.

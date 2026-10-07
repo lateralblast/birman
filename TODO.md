@@ -55,6 +55,12 @@ and the macOS thread/memory detection in `start_llama.py`.
 - [ ] `run_inference_server.py` was only smoke-tested with the flag (starts, answers, 44.5 t/s on 2B-4T), not
   benchmarked under load.
 
+## Network access
+
+- [ ] `start_llama.py --open` firewall handling (ufw, firewalld, removal on exit, `--close`) was only run against a
+  stand-in command, not an enabled ufw/firewalld (neither is enabled on the i9 or the Xeon). Plain iptables/nftables
+  are not handled.
+
 ## Build
 
 - [ ] OpenMP built with clang against GCC's `libgomp` was about 10x slower on the Xeon (2B-4T pp512 18.8 t/s against

@@ -34,16 +34,25 @@ Opt-outs: --no-numa / BITNET_NUMA=0; --numa-evict / BITNET_NUMA_EVICT=1; -t to c
 """
 import argparse
 import glob
+import json
 import math
 import os
 import platform
 import re
+import secrets
+import shutil
+import signal
 import shlex
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")) as _f:
+        VERSION = _f.read().strip()
+except OSError:
+    VERSION = "unknown"
 import model_picker as picker  # noqa: E402
 import numa_distribute as numa  # noqa: E402
 
@@ -207,10 +216,190 @@ def has_flag(args, *names):
     return any(a == n or a.startswith(n + "=") for a in args for n in names)
 
 
-def build_command(binary, model, passthrough, threads, numa_enabled, tool):
-    """Return (command, notes). Flags the user gave are never overridden."""
+DEFAULT_KEY_FILE = os.path.join(os.path.expanduser("~"), ".cache", "start_llama", "api_key")
+
+
+def key_file_arg(args):
+    """Path given with --api-key-file (either spelling), or None."""
+    for i, a in enumerate(args):
+        if a == "--api-key-file" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--api-key-file="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def ensure_api_key(passthrough, dry_run):
+    """For --open without a key: use the key file (given, or ~/.cache/start_llama/api_key), creating it with a fresh
+    random key when it is missing or empty. Returns (passthrough with --api-key-file, key or None, path or None)."""
+    if has_flag(passthrough, "--api-key") or os.environ.get("LLAMA_API_KEY"):
+        return passthrough, None, None
+    path = key_file_arg(passthrough) or DEFAULT_KEY_FILE
+    key = None
+    try:
+        with open(path) as f:
+            key = next((ln.strip() for ln in f if ln.strip() and not ln.startswith("#")), None)
+    except OSError:
+        pass
+    if key is None and not dry_run:
+        key = secrets.token_urlsafe(32)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key + "\n")
+        print("  generated a new API key in %s" % path, file=sys.stderr)
+    if not has_flag(passthrough, "--api-key-file"):
+        passthrough = passthrough + ["--api-key-file", path]
+    return passthrough, key, path
+
+
+def server_port(args):
+    """Port the server will listen on: --port/-p from the arguments, else llama-server's default 8080."""
+    for i, a in enumerate(args):
+        if a in ("--port", "-p") and i + 1 < len(args) and args[i + 1].isdigit():
+            return int(args[i + 1])
+        if a.startswith("--port=") and a[7:].isdigit():
+            return int(a[7:])
+    return 8080
+
+
+def _run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+FIREWALL_STATE = os.path.join(os.path.expanduser("~"), ".cache", "start_llama", "firewall.json")
+
+
+def firewall_plan(port):
+    """(name, already-open check, open command, close command) for the enabled host firewall, or None (Linux: ufw,
+    firewalld). Plain iptables/nftables are not touched: their rule sets are too varied to extend safely."""
+    if sys.platform != "linux":
+        return None
+    sudo = [] if os.geteuid() == 0 else ["sudo", "-n"]
+    if shutil.which("ufw"):
+        enabled = False
+        try:
+            with open("/etc/ufw/ufw.conf") as f:
+                enabled = any(ln.strip().lower() == "enabled=yes" for ln in f)
+        except OSError:
+            r = _run(sudo + ["ufw", "status"])
+            enabled = bool(r and "Status: active" in r.stdout)
+        if enabled:
+            return ("ufw", None, sudo + ["ufw", "allow", "%d/tcp" % port, "comment", "start_llama"],
+                    sudo + ["ufw", "delete", "allow", "%d/tcp" % port])
+    if shutil.which("firewall-cmd"):
+        r = _run(["firewall-cmd", "--state"])
+        if r and r.stdout.strip() == "running":
+            return ("firewalld", ["firewall-cmd", "--query-port=%d/tcp" % port], sudo + ["firewall-cmd", "--add-port=%d/tcp" % port],
+                    sudo + ["firewall-cmd", "--remove-port=%d/tcp" % port])
+    return None
+
+
+def _save_state(entries):
+    try:
+        os.makedirs(os.path.dirname(FIREWALL_STATE), exist_ok=True)
+        if entries:
+            with open(FIREWALL_STATE, "w") as f:
+                json.dump(entries, f)
+        elif os.path.exists(FIREWALL_STATE):
+            os.remove(FIREWALL_STATE)
+    except OSError:
+        pass
+
+
+def _load_state():
+    try:
+        with open(FIREWALL_STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def open_firewall(port, dry_run):
+    """Open the port if a firewall is enabled and does not already allow it. Returns True when a rule was added
+    (recorded in FIREWALL_STATE so close_firewall can remove exactly that rule)."""
+    plan = firewall_plan(port)
+    if not plan:
+        print("  firewall: none detected (ufw/firewalld), nothing to open", file=sys.stderr)
+        return False
+    name, query, cmd, undo = plan
+    if dry_run:
+        print("  firewall: %s is enabled; would run `%s`" % (name, shlex.join(cmd)), file=sys.stderr)
+        return False
+    if query:
+        q = _run(query)
+        if q and q.stdout.strip() == "yes":
+            print("  firewall: %s already allows tcp/%d; left as it is" % (name, port), file=sys.stderr)
+            return False
+    r = _run(cmd)
+    if not (r and r.returncode == 0):
+        print("  WARNING: %s is enabled but `%s` failed (%s); run it as root or the port stays blocked"
+              % (name, shlex.join(cmd), (r.stderr.strip() if r else "could not run")[:120] or "no detail"), file=sys.stderr)
+        return False
+    if "existing rule" in (r.stdout + r.stderr).lower():
+        print("  firewall: %s already allows tcp/%d; left as it is" % (name, port), file=sys.stderr)
+        return False
+    _save_state(_load_state() + [{"name": name, "port": port, "undo": undo}])
+    print("  firewall: %s now allows tcp/%d%s; it is removed again when the server exits (or: start_llama.py --close)"
+          % (name, port, " (runtime only)" if name == "firewalld" else ""), file=sys.stderr)
+    return True
+
+
+def close_firewall(dry_run=False):
+    """Remove every rule open_firewall added (restores the firewall to how it was). Returns 0, or 1 if one failed."""
+    entries = _load_state()
+    if not entries:
+        print("  firewall: no rule added by start_llama.py is recorded; nothing to close", file=sys.stderr)
+        return 0
+    left, rc = [], 0
+    for e in entries:
+        if dry_run:
+            print("  firewall: would run `%s`" % shlex.join(e["undo"]), file=sys.stderr)
+            left.append(e)
+            continue
+        r = _run(e["undo"])
+        if r and r.returncode == 0:
+            print("  firewall: %s no longer allows tcp/%d" % (e["name"], e["port"]), file=sys.stderr)
+        else:
+            rc = 1
+            left.append(e)
+            print("  WARNING: `%s` failed (%s); the rule is still in place, retry with --close"
+                  % (shlex.join(e["undo"]), (r.stderr.strip() if r else "could not run")[:120] or "no detail"), file=sys.stderr)
+    if not dry_run:
+        _save_state(left)
+    return rc
+
+
+def run_and_close(binary, cmd):
+    """Run the server as a child so the firewall rule can be removed when it exits (Ctrl-C and SIGTERM included).
+    A SIGKILL of this script cannot be caught: use --close then."""
+    proc = subprocess.Popen(cmd)
+
+    def forward(signum, _frame):
+        try:
+            proc.send_signal(signum)
+        except OSError:
+            pass
+    old = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        return proc.wait()
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
+        close_firewall()
+
+
+def build_command(binary, model, passthrough, threads, numa_enabled, tool, host=None):
+    """Return (command, notes). Flags the user gave are never overridden. host: "127.0.0.1" or "0.0.0.0" (server only)."""
     cmd = [binary]
     notes = []
+    if host:
+        cmd += ["--host", host]
+        notes.append("listening on %s%s" % (host, " (all interfaces, no authentication unless --api-key is given)"
+                                            if host == "0.0.0.0" and not has_flag(passthrough, "--api-key", "--api-key-file") else ""))
     if model:
         cmd += ["-m", model]
     cmd += ["-t", str(threads)]
@@ -232,6 +421,7 @@ def parse(argv):
     p = argparse.ArgumentParser(description="Start a llama.cpp binary with flags chosen for this machine.",
                                 epilog="Unrecognised arguments are passed to the llama binary unchanged.",
                                 allow_abbrev=False)
+    p.add_argument("--version", action="version", version="start_llama.py " + VERSION)
     p.add_argument("--tool", choices=sorted(TOOLS), default="server", help="which binary to run (default: server)")
     p.add_argument("-m", "--model", help="path to the GGUF model (default: choose the best one for this machine from models/)")
     p.add_argument("-t", "--threads", type=int, help="thread count (default: physical cores this process may use)")
@@ -243,8 +433,18 @@ def parse(argv):
     p.add_argument("--min-tps", type=float, default=picker.DEFAULT_MIN_TPS, help="minimum measured generation speed for an automatically chosen model (default: %(default)s t/s)")
     p.add_argument("--no-probe", action="store_true", help="choose the model by memory fit only, without measuring its speed")
     p.add_argument("--reprobe", action="store_true", help="ignore cached speed measurements")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--local", action="store_true", help="server: listen on localhost only (127.0.0.1; llama-server's own default)")
+    g.add_argument("--open", action="store_true", help="server: listen on all interfaces (0.0.0.0) so other machines can reach the API; combine with --api-key KEY")
+    p.add_argument("--close", action="store_true", help="remove the firewall rules a previous --open run added, then exit (they are also removed when the server exits)")
+    p.add_argument("--no-firewall", action="store_true", help="with --open: do not add a firewall rule for the server port (ufw/firewalld)")
     p.add_argument("--bin-dir", default=os.path.join(ROOT, "build", "bin"), help="directory with the llama binaries")
-    return p.parse_known_args(argv)
+    args, rest = p.parse_known_args(argv)
+    if (args.local or args.open) and args.tool != "server":
+        p.error("--local/--open only apply to --tool server")
+    if (args.local or args.open) and has_flag(rest, "--host"):
+        p.error("--local/--open conflict with --host")
+    return args, rest
 
 
 def choose_model(args, m, threads):
@@ -294,6 +494,9 @@ def choose_model(args, m, threads):
 
 def main(argv=None):
     args, passthrough = parse(sys.argv[1:] if argv is None else argv)
+    if args.close:
+        return close_firewall(args.check)
+    fw_added = False
     m = detect()
     threads = args.threads if args.threads else m["threads"]
 
@@ -313,6 +516,14 @@ def main(argv=None):
     for w in warnings_for(m, model_bytes):
         print("  WARNING: " + w, file=sys.stderr)
 
+    if args.open:
+        passthrough, key, key_path = ensure_api_key(passthrough, args.check)
+        if key_path:
+            print("  API key (%s): %s" % (key_path, key or "<would be generated on start>"), file=sys.stderr)
+            print("  clients send it as:  Authorization: Bearer <key>", file=sys.stderr)
+        if not args.no_firewall:
+            fw_added = open_firewall(server_port(passthrough), args.check)
+
     binary = os.path.join(args.bin_dir, TOOLS[args.tool])
     problems = []
     if not os.path.isfile(binary):
@@ -323,7 +534,8 @@ def main(argv=None):
         elif not os.path.isfile(args.model):
             problems.append("model not found: %s" % args.model)
 
-    cmd, notes = build_command(binary, args.model, passthrough, threads, not args.no_numa, args.tool)
+    cmd, notes = build_command(binary, args.model, passthrough, threads, not args.no_numa, args.tool,
+                              "0.0.0.0" if args.open else "127.0.0.1" if args.local else None)
     print("  " + "; ".join(notes), file=sys.stderr)
     print("  command: " + shlex.join(cmd), file=sys.stderr)
 
@@ -339,6 +551,8 @@ def main(argv=None):
     if numa.evict_requested(args.numa_evict) and "--numa" in cmd and args.model and args.model not in evicted:
         print("  %s %s from the page cache" % ("evicted" if numa.evict_from_page_cache(args.model) else "could not evict", args.model),
               file=sys.stderr)
+    if fw_added:
+        return run_and_close(binary, cmd)
     os.execv(binary, cmd)
 
 
