@@ -8,27 +8,34 @@
 > **In short**
 > - `BitNet-b1.58-2B-4T` generates 23.4 tokens/s on an 8-core i9-9900 (idle machine, 8 threads) and 60.3 t/s on a 2-socket, 32-core Xeon with `start_llama.py`'s defaults; Llama3-8B-1.58 generates 12.3 and 33.3 t/s.
 > - I2_S quantization costs nothing measurable: perplexity is within 1.1% of the f32 model on five models, identical on both x86 machines and within about 0.01 on the Apple M1 Max.
-- On Apple Silicon (NEON kernels, patches `0010`/`0011`) 2B-4T generates 74-77 t/s with 8 threads on an M1 Max (two runs) and about 94 t/s with the Q8_0 token embedding; the scalar fallback before them managed 4.72 t/s prompt and 3.55 t/s generation.
-- A Q8_0 token embedding (`build.sh` writes it, `start_llama.py` prefers it) speeds generation up by up to 30% where the embedding is also the output layer (2B-4T on the i9: 23.6 to 30.7 t/s; on the M1 Max 76.0 to 93.7) with no measurable accuracy cost.
-> - On a multi-socket machine llama.cpp's `--numa distribute` roughly doubles generation speed (a gain `numactl --interleave=all` does not give); the launcher scripts add it automatically, and `start_llama.py` can also choose the model.
+> - On Apple Silicon (NEON kernels, patches `0010`/`0011`) 2B-4T generates 74-77 t/s with 8 threads on an M1 Max (two runs) and about 94 t/s with the Q8_0 token embedding; the scalar fallback before them managed 4.72 t/s prompt and 3.55 t/s generation.
+> - A Q8_0 token embedding (`build.sh` writes it, `start_llama.py` prefers it) speeds generation up by up to 30% where the embedding is also the output layer (2B-4T on the i9: 23.6 to 30.7 t/s; on the M1 Max 76.0 to 93.7) with no measurable accuracy cost.
+> - On a multi-socket machine llama.cpp's `--numa distribute` roughly doubles generation speed (a gain `numactl --interleave=all` does not give); the launcher scripts add it automatically. `start_llama.py` also chooses (or fetches and builds) the model for the machine, serves it over the LAN with a generated API key, and can serve an embedding model for RAG.
 >
-> **Contents:** [Quick start](#quick-start) | [What changed](#what-changed) | [Performance](#performance) | [Model selection](#model-selection) | [Accuracy](#accuracy) | [Server API smoke test](#server-api-smoke-test) | [Verified](#verified) | [Known issues](#known-issues)
+> **Contents:** [Quick start](#quick-start) | [What changed](#what-changed) | [Performance](#performance) | [Model selection](#model-selection) | [RAG](#retrieval-augmented-generation-rag) | [Accuracy](#accuracy) | [Server API smoke test](#server-api-smoke-test) | [Verified](#verified) | [Known issues](#known-issues)
 
 ## Quick start
 
 ```bash
-./build.sh                                     # submodule, patches, venv, model download, build
-python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -p "You are a helpful assistant" -cnv
-./start_llama.py                               # server with the best model for this machine (--check previews it)
-./start_llama.py --tool cli -m MODEL.gguf -p "Hello"     # any other llama.cpp binary
-./start_llama.py -m falcon --largest            # name instead of path: the largest model whose name contains "falcon"
-./start_llama.py -m falcon3-10b                 # not installed? looked up, judged for this machine (asks first if unsuitable), downloaded and built
-./start_llama.py --local                        # server on 127.0.0.1 only (llama-server's default)
-./start_llama.py --open --api-key KEY          # server on 0.0.0.0; with no key given, one is generated, saved to ~/.cache/start_llama/api_key (0600) and printed
-                                               # (also opens the port in ufw/firewalld if enabled; --no-firewall skips)
-./start_llama.py --close                        # remove the firewall rule(s) a previous --open run added (also done when the server exits)
-python utils/test_server_api.py                # smoke test of a running server
+./build.sh                                  # submodule, patches, venv, model download, build
+python utils/test_server_api.py             # smoke test of a running server (--url, --api-key)
 ```
+
+`start_llama.py` is the way to run things: it checks the machine and picks threads, NUMA flags and (without `-m`) the model.
+
+```bash
+./start_llama.py                            # server, best model for this machine (--check previews, runs nothing)
+./start_llama.py -m falcon                  # a name instead of a path; --largest = the largest match
+./start_llama.py -m falcon3-10b             # not installed: judged for this machine, asks first if unsuitable, fetched and built
+./start_llama.py --tool cli -m MODEL.gguf -p "Hello"     # any other llama.cpp binary
+
+./start_llama.py --local                    # server on 127.0.0.1 only (llama-server's default)
+./start_llama.py --open                     # server on 0.0.0.0 with a generated API key (printed; firewall port opened)
+./start_llama.py --close                    # remove a firewall rule an earlier --open run left behind
+./start_llama.py --embedding --open         # embedding server (RAG) on port 8081
+```
+
+The upstream scripts still work (`python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -p "You are a helpful assistant" -cnv`).
 
 **Build requirements:** `cmake` (3.22 or later), `clang` (18 or later; `setup_env.py` hard-codes clang), `python` 3.10 or later with the venv module (`python3.14-venv` on Ubuntu). `numactl` is optional. Python 3.10-3.12 avoids the numpy pin described above; `./build.sh` handles it on newer versions.
 
@@ -62,19 +69,52 @@ The submodule is a fork that cannot be pushed to, so fixes are kept as patches i
 
 ### Launching
 
-- **`start_llama.py`** starts any llama.cpp binary with flags chosen for the machine: `./start_llama.py -m MODEL.gguf` runs the server, `--tool cli|completion|bench|perplexity` another binary, `--check` prints what it found and the command without running anything. It:
-  - reads the CPU topology from `/sys` (on macOS: the performance-core count from `sysctl hw.perflevel0.physicalcpu`) and uses the number of physical cores this process may use as `-t` (SMT siblings count once; an affinity mask or a cgroup CPU quota lowers it), which is where generation peaked on both machines tested (8 on the i9-9900; 32 on the 2-socket Xeon with `--numa distribute`; prompt-heavy work may gain a little from more, pass `-t`);
-  - adds `--numa distribute` on multi-node Linux machines (`numa_distribute.py`; `--no-numa`, `--numa-evict`; see [NUMA placement](#numa-placement));
-  - adds `-ngl 0` and, for the 2B-4T model on the server or cli, its chat template;
-  - warns when an x86 CPU has no AVX2 (the scalar fallback runs) or when the model does not fit in free RAM (on macOS read from `sysctl hw.memsize` and `vm_stat`);
-  - **`-m` accepts a name as well as a path:** every word (case and punctuation ignored) must occur in the model's directory or file name, so `-m falcon`, `-m "falcon 7b"`, `-m 2b-4t` or `-m llama` find the model under `models/`. Several matches are ranked and probed like the automatic choice (memory fit, then measured speed), so you get the best match that fits; with `--embedding`, `-m 270m` picks the 270M embedding model. No match lists what is available. **`--largest`** (same as `--prefer largest`) ranks by parameter count only, ignoring the chat preference: `--largest -m falcon` is the largest Falcon model, `--largest` alone the largest model of all. On the Xeon, `-m falcon` and `--largest -m falcon` both give Falcon3-7B-Instruct (7.46 B; the chat preference only changes the order when a base model is among the matches);
-  - **fetches a model that is not installed:** when `-m NAME` matches nothing under `models/`, the name is looked up in a catalogue (`model_fetch.py`: the Hugging Face models `setup_env.py` supports, plus the two BitNet embedding models with `--embedding`; `-m falcon-e-3b`, `-m "falcon3 10b"`) and the best match is downloaded and built: `setup_env.py -hr REPO -q i2_s -md MODELS_DIR` for the conversion models (the f32 intermediate is deleted afterwards), `huggingface-cli download` for the embedding GGUFs. Before downloading it judges the model for this machine from estimates (about 0.38 GiB of I2_S file, 2 GB of download and 4.5 GiB of peak conversion memory per billion parameters, free RAM + swap, free disk, and a generation speed estimated from the speed measured on a local model, since a memory-bound model's speed scales with its file size) and, **only if it does not look suitable, asks `[y/N]` first** and explains why; without a terminal it refuses unless `--yes` is given. `--no-fetch` never downloads, `--check` prints the plan and the questions it would ask without fetching. Tested with a real fetch of Falcon-E-1B-Base into an empty directory (1.7 B: downloaded, converted, 0.55 GiB I2_S file, benchmarked at 41.6 t/s with 8 threads on the i9; the 12 GiB-disk check refused it on a 7 GiB tmpfs and asked first, and with a disk with room it went ahead without asking); `--check` on larger models (Falcon3-10B asks first: 46 GiB conversion peak against 16.5 GiB RAM + 10 GiB swap here, estimated 7 t/s). Not run for the embedding models, and `-m NAME` only fetches when *nothing* local matches (`-m falcon` with any Falcon installed uses that one);
-  - **without `-m` chooses the model for the machine** (`model_picker.py`; see [Model selection](#model-selection)): `--prefer largest`, `--min-tps N`, `--no-probe`, `--reprobe`, `--models-dir`;
-  - **network access (server only):** by default `llama-server` listens on `127.0.0.1`; `--local` says so explicitly, `--open` listens on `0.0.0.0`. With `--open` and no key it generates one (`secrets.token_urlsafe`), stores it in `~/.cache/start_llama/api_key` (0600, or the file given with `--api-key-file`; reused on later starts), prints it and starts the server with `--api-key-file`; clients send `Authorization: Bearer <key>` (`/health` and `/v1/models` stay public, as in llama-server). If ufw or firewalld is enabled it also opens the port (`sudo -n`; firewalld runtime-only), records only a rule it added itself in `~/.cache/start_llama/firewall.json`, and removes it when the server exits (the server then runs as a child process; Ctrl-C/SIGTERM are forwarded). `--close` removes recorded rules after an unclean exit (SIGKILL, crash), `--no-firewall` skips the step; plain iptables/nftables are not touched. `--local`/`--open` conflict with each other and with `--host`; `--check` shows the plan without changing anything. Tested with a stand-in firewall command and against a real `--open` server (Xeon, 19/19 checks over the LAN with the key); not yet run against an enabled ufw or firewalld;
-  - passes everything it does not recognise to the llama binary unchanged, and never overrides a flag you give yourself (`-ngl`, `--numa`, `--chat-template-file`).
+**`start_llama.py`** starts any llama.cpp binary with flags chosen for the machine: `./start_llama.py -m MODEL.gguf` runs the server, `--tool cli|completion|bench|perplexity` another binary, `--check` (or `--dry-run`) prints what it found and the command without running anything. Anything it does not recognise is passed to the llama binary unchanged, and a flag you give yourself (`-ngl`, `--numa`, `--chat-template-file`, `--host`, `--port`) is never overridden.
 
-  On the Xeon it reports 2 sockets, 32 physical cores and 2 NUMA nodes and starts with `-t 32 --numa distribute`; restricted to one socket with `numactl --cpunodebind=0` it drops to 16 threads. Through `--tool bench` there, generation was 28.6 t/s with `--no-numa` and 56.9 t/s with the defaults after `--numa-evict` (prompt processing, 400 and 384 t/s, was within noise). Topology detection covers Linux and macOS; elsewhere the thread count falls back to the logical CPU count. On an M1 Max it starts with `-t 8`: the two efficiency cores make the barrier-synchronized threads wait, and 2B-4T generation at 10 threads falls to 13.8 t/s from about 64.
-- **`run_inference.py`** uses `llama-completion` for plain prompts (current `llama-cli` is chat-only), maps `-p` to the system prompt in `-cnv` mode, and uses `chat-templates/bitnet-b1.58-2B-4T.jinja` for the 2B-4T model; the GGUF's embedded template ends the prompt with an EOS token, which made chat answers unrelated to the question. **`run_inference_server.py`** does the same for the server. Both add `--numa distribute` on multi-node machines.
+| Option | Effect |
+|---|---|
+| `-m PATH` or `-m NAME` | Model file, or a name looked up under `models/` (see [Choosing a model by name](#choosing-a-model-by-name)). Without `-m` the best model for the machine is chosen ([Model selection](#model-selection)). |
+| `--largest` (`--prefer largest`), `--prefer chat` | Rank by parameter count only, or chat-capable models first (default). |
+| `--min-tps N`, `--no-probe`, `--reprobe`, `--models-dir DIR` | Minimum measured speed for an automatic choice (default 10 t/s), skip or redo the speed probe, where to look for models. |
+| `-t N` | Thread count (default: physical cores). |
+| `--no-numa`, `--numa-evict` | Do not add `--numa distribute` on multi-node machines; drop the model from the page cache first ([NUMA placement](#numa-placement)). |
+| `--local`, `--open`, `--close`, `--no-firewall` | Network access ([below](#network-access)). |
+| `--no-fetch`, `--yes` | Fetching models that are not installed ([below](#fetching-a-model-that-is-not-installed)). |
+| `--embedding` | Serve an embedding model for [RAG](#retrieval-augmented-generation-rag). |
+| `--version` | Print the version (`VERSION`). |
+
+What it sets up by itself:
+
+- **Threads:** reads the CPU topology from `/sys` (on macOS the performance-core count from `sysctl hw.perflevel0.physicalcpu`) and uses the number of physical cores this process may use as `-t` (SMT siblings count once; an affinity mask or a cgroup CPU quota lowers it). Generation peaked there on both machines tested: 8 on the i9-9900, 32 on the 2-socket Xeon with `--numa distribute`; prompt-heavy work may gain a little from more, pass `-t`. On an M1 Max it starts with `-t 8`: the two efficiency cores make the barrier-synchronized threads wait, and 2B-4T generation at 10 threads falls to 13.8 t/s from about 64. Topology detection covers Linux and macOS; elsewhere the thread count falls back to the logical CPU count.
+- **NUMA:** adds `--numa distribute` on multi-node Linux machines (`numa_distribute.py`). On the Xeon it reports 2 sockets, 32 physical cores and 2 NUMA nodes and starts with `-t 32 --numa distribute`; restricted to one socket with `numactl --cpunodebind=0` it drops to 16 threads. Through `--tool bench` there, generation was 28.6 t/s with `--no-numa` and 56.9 t/s with the defaults after `--numa-evict` (prompt processing, 400 and 384 t/s, was within noise).
+- **Other flags:** `-ngl 0` and, for the 2B-4T model on the server or cli, its chat template.
+- **Warnings:** an x86 CPU without AVX2 (the scalar fallback runs), or a model that does not fit in free RAM (on macOS read from `sysctl hw.memsize` and `vm_stat`).
+
+#### Choosing a model by name
+
+`-m` accepts a name as well as a path. Every word (case and punctuation ignored) must occur in the model's directory or file name, so `-m falcon`, `-m "falcon 7b"`, `-m 2b-4t` or `-m llama` find the model under `models/`. Several matches are ranked and probed like the automatic choice (memory fit, then measured speed), so you get the best match that fits; with `--embedding`, `-m 270m` picks the 270M embedding model. No match lists what is available. `--largest` ranks by parameter count only, ignoring the chat preference: `--largest -m falcon` is the largest Falcon model, `--largest` alone the largest model of all. On the Xeon, `-m falcon` and `--largest -m falcon` both give Falcon3-7B-Instruct (7.46 B); the chat preference only changes the order when a base model is among the matches.
+
+#### Fetching a model that is not installed
+
+When `-m NAME` matches nothing under `models/`, the name is looked up in a catalogue (`model_fetch.py`: the Hugging Face models `setup_env.py` supports, plus the two BitNet embedding models with `--embedding`; for example `-m falcon-e-3b` or `-m "falcon3 10b"`) and the best match is downloaded and built: `setup_env.py -hr REPO -q i2_s -md MODELS_DIR` for the conversion models (the f32 intermediate is deleted afterwards), `huggingface-cli download` for the embedding GGUFs. A name only fetches when *nothing* local matches it (`-m falcon` with any Falcon installed uses that one).
+
+Before downloading it judges the model for this machine from estimates: about 0.38 GiB of I2_S file, 2 GB of download and 4.5 GiB of peak conversion memory per billion parameters, against free RAM plus swap and free disk, and a generation speed estimated from the speed measured on a local model (a memory-bound model's speed scales with its file size). **Only if it does not look suitable does it ask `[y/N]` first**, and says why; without a terminal it refuses unless `--yes` is given. `--no-fetch` never downloads; `--check` prints the plan and the questions it would ask, without fetching.
+
+Tested: a real fetch of Falcon-E-1B-Base into an empty directory (1.7 B; downloaded, converted, 0.55 GiB I2_S file, 41.6 t/s with 8 threads on the i9). The 12 GiB disk check refused it on a 7 GiB tmpfs and asked first; with a disk with room it went ahead without asking. `--check` on larger models: Falcon3-10B asks first (46 GiB conversion peak against 16.5 GiB RAM + 10 GiB swap here, estimated 7 t/s). Not run for the embedding models.
+
+#### Network access
+
+Server only. By default `llama-server` listens on `127.0.0.1`; `--local` says so explicitly, `--open` listens on `0.0.0.0`.
+
+- **API key:** with `--open` and no key it generates one (`secrets.token_urlsafe`), stores it in `~/.cache/start_llama/api_key` (mode 0600, or the file given with `--api-key-file`; reused on later starts), prints it and starts the server with `--api-key-file`. Clients send `Authorization: Bearer <key>`; `/health` and `/v1/models` stay public, as in llama-server. A key you give (`--api-key`, `LLAMA_API_KEY`) is used as it is.
+- **Firewall:** if ufw or firewalld is enabled it opens the port (`sudo -n`; firewalld runtime-only), records only a rule it added itself in `~/.cache/start_llama/firewall.json`, and removes it when the server exits (the server then runs as a child process; Ctrl-C and SIGTERM are forwarded). `--close` removes recorded rules after an unclean exit (SIGKILL, crash), `--no-firewall` skips the step. Plain iptables/nftables are not touched.
+- `--local` and `--open` conflict with each other and with `--host`; `--check` shows the plan without changing anything.
+
+Tested with a stand-in firewall command and against a real `--open` server (Xeon, 19/19 API checks over the LAN with the key). Not yet run against an enabled ufw or firewalld.
+
+#### Other launchers
+
+**`run_inference.py`** uses `llama-completion` for plain prompts (current `llama-cli` is chat-only), maps `-p` to the system prompt in `-cnv` mode, and uses `chat-templates/bitnet-b1.58-2B-4T.jinja` for the 2B-4T model; the GGUF's embedded template ends the prompt with an EOS token, which made chat answers unrelated to the question. **`run_inference_server.py`** does the same for the server. Both add `--numa distribute` on multi-node machines.
 
 ### Tests and benchmarks (`utils/`)
 
@@ -298,7 +338,7 @@ So the default build and the default flags stay. Why the `libgomp` build is so s
 
 ## Model selection
 
-*What `start_llama.py` does when no `-m` is given; tested 2026-10-05.*
+*What `start_llama.py` does when no `-m` is given; tested 2026-10-05, the Xeon default row 2026-10-07.*
 
 The policy: take the canonical quantized models under `models/` (`ggml-model-{i2_s,tl1,tl2}.gguf`, with the `-q8emb` variant, then the `-f16emb` one, winning in a directory; f32 files, embedding models and stale `.bad`/`.old` variants are ignored), parameter counts read from the GGUF headers (they match `llama-bench`'s counts for all six models); keep those that fit (1.2 x the file + 0.5 GiB within the available memory, lowered by a cgroup limit); try them best first - chat-capable models (names with "instruct", and 2B-4T), then more parameters, or just more parameters with `--prefer largest` - and use the first whose measured generation speed reaches 10 t/s (`--min-tps`). The speed is a few-second `llama-bench` probe (`-n 4,16`) run with the same threads and `--numa` flags the server will get; a model at least as large as one that was too slow is not probed, and if none is fast enough the smallest that fits is used with a warning. Results are cached for 7 days. Parameter count is only a proxy for quality, and "chat-capable" is a name heuristic; pass `-m` to choose yourself. What it chose, with the measured probe speeds (t/s) and the models it rejected:
 
@@ -309,32 +349,9 @@ The policy: take the canonical quantized models under `models/` (`ggml-model-{i2
 | i9-9900 limited to 4 cores / 2 cores | BitNet-2B-4T | 13.4 / 11.3 t/s |
 | i9-9900 limited to 1 core | Falcon-E-1B-Instruct | 2B-4T measured 8.1 (below 10); Falcon-E 15.8 |
 | i9-9900, `--min-tps 30` | Falcon-E-1B-Instruct | 2B-4T measured 17.6 (below 30); Falcon-E 43.6 |
-| 2 x Xeon, default policy (before Falcon3-7B was added) | BitNet-2B-4T | 32.3 t/s (53.4 after `--numa-evict`) |
-| 2 x Xeon, default policy (with Falcon3-7B-Instruct, 2026-10-07) | Falcon3-7B-Instruct-1.58bit | the largest chat-capable model; measured 37.0 t/s with `-p 512 -n 128` after `--numa-evict` (21.6 unplaced), above the 10 t/s minimum. Pass `-m` for 2B-4T (60-69 t/s) |
+| 2 x Xeon, default policy | Falcon3-7B-Instruct-1.58bit (BitNet-2B-4T before it was installed) | the largest chat-capable model that clears 10 t/s: 37.0 t/s (`-p 512 -n 128`, after `--numa-evict`; 21.6 on an unplaced cache). Use `-m 2b-4t` for 2B-4T (60-69 t/s) |
 | 2 x Xeon, `--prefer largest` | Llama3-8B | 19.2 t/s, so the bigger machine gets the bigger model |
 | available memory 64 GB / 4 GB / 1.6 GB / 1.0 GB / 0.4 GB (simulated) | 2B-4T / 2B-4T / Falcon-E-1B / bitnet_b1_58-large / nothing fits | memory fit alone |
-
-### Retrieval-augmented generation (RAG)
-
-RAG needs two models: an embedding model to find the relevant text and a chat model to answer from it. The repo has both halves:
-
-```bash
-# once: the I2_S embedding model (Hugging Face repo microsoft/BitNet-embedding-0.6B contains the ready GGUF)
-huggingface-cli download microsoft/BitNet-embedding-0.6B --local-dir models/bitnet-embedding-0.6b
-./start_llama.py --open                       # chat model, port 8080 (key generated, see Launching)
-./start_llama.py --embedding --open           # embedding server, port 8081, same key file
-python utils/rag_demo.py --docs README.md docs/ --host SERVER --api-key-file KEYFILE "How is the API key stored?"
-```
-
-`--embedding` runs `llama-server --embedding` with the 0.6B embedding model from `models/` (the 270M one if that is all there is; `-m` to choose), `-b/-ub 2048` and port 8081 unless `--port` is given; `--local`, `--open`, the key and the firewall handling work as for the chat server. It serves `/v1/embeddings`: 1024-dimension, L2-normalised vectors for the 0.6B model (640 for the 270M). The model card says to give *queries* the instruction `Instruct: <task>\nQuery: <question>` and documents nothing.
-
-`utils/rag_demo.py` (standard library only) is a minimal end-to-end example: it splits files into chunks, embeds them (vectors are cached in `~/.cache/start_llama/rag_vectors.json`), embeds the question, takes the `--top-k` most similar chunks by cosine similarity and asks the chat server to answer from them. It keeps the index in memory; use a vector store for anything large.
-
-Measured on the 2-socket Xeon (32 threads, `--numa distribute`), 0.6B I2_S model over the LAN: about 700 tokens/s of embedding throughput (16 chunks of ~900 characters in 4.8 s, one chunk in 0.3 s); a batch gives the same vector as the text alone (cosine 0.9997); an unauthenticated request gets 401. **Quality is only lightly checked:** 4 of 5 toy questions matched the right sentence, but on this README as a corpus (long, dense bullets) the right passage was in the top 4 for only about 2 of 7 questions and in the top 8 for about 5 of 7 (crude keyword check; chunk sizes of 300-800 characters made no clear difference), and the 2.4B chat model often answered "the context does not contain the answer" even when it did, or answered from its own knowledge. Treat it as a working pipeline, not a tuned one: a cleaner corpus, a cross-encoder reranker, or a larger chat model would be the next steps. The MTEB table in `docs/bitnet-embeddings-i2s-guide.md` was not reproduced.
-
-### A larger instruct model: Falcon3-7B-Instruct-1.58bit
-
-`python setup_env.py -hr tiiuae/Falcon3-7B-Instruct-1.58bit -q i2_s` (on the Xeon: the download is 13 GB, the f32 intermediate 29.8 GB, the final I2_S file 2.61 GiB, 7.46 B parameters; about 5 minutes). It is the largest instruction-tuned model that bitnet.cpp supports here, but it is a post-training-quantized Falcon3, not a natively trained BitNet (no natively trained BitNet larger than 2B-4T has been published as far as a web search found). On the 2-socket Xeon, 32 threads, `--numa distribute`, `llama-bench` t/s: pp512 153-163, tg128 **37.0 after `--numa-evict`** (21.6 on a cache that was not placed), against Llama3-8B at 33.3 and 2B-4T at 60-69. Sanity checks: it answers "Paris" and "Canberra", writes a correct recursive Fibonacci function and solves the 60 km in 45 minutes problem (80 km/h) with a worked answer. In the RAG demo (above) it answered the repo questions wrongly and confidently (it was given passages the 0.6B embedder did not retrieve), so there the retriever, not the generator, was the limit. Perplexity: 10.97 +/- 0.27 on the WikiText-2 slice, and I2_S loses 0.7% against the f32 GGUF it came from (see [Accuracy](#accuracy)). The f32 file `ggml-model-f32.gguf` stays in the model directory after conversion (29.8 GB); `utils/cleanup_stale_models.sh` does not know about it yet.
 
 ### Listing the models on a machine
 
@@ -373,6 +390,28 @@ Example output on the 2-socket Xeon (the server address is left out; `--check` r
 Since `build.sh` writes a Q8_0-embedding copy of a model whose embedding is f16 or f32, `start_llama.py` now picks that file (2B-4T: 0.82 GiB instead of 1.11 GiB), which generates up to 30% faster, so the speeds in the table above, measured with the f16 files, are conservative.
 
 The probe is accurate: its 16-token reading was within about 1% of a 128-token, three-repeat measurement (2B-4T 17.05 against 17.01 t/s, Llama3-8B 9.16 against 9.08) and takes 2-3 s per model. It reflects the conditions at the time: while other work was running the i9 measured 17 t/s for 2B-4T where the earlier idle-machine benchmarks above gave 23.4, and 16 threads fell to 9.8 t/s. On a multi-socket machine the reading is only representative once the model's pages are placed by the pinned threads (32.3 t/s with the page cache as it was, 53.4 after `--numa-evict`, which evicts before the probe so the probe places them). A corrupt GGUF in `models/` is skipped with a message, and an empty `models/` exits with guidance. Chosen models were then started and passed the 18-check API test on both machines (below).
+
+### A larger instruct model: Falcon3-7B-Instruct-1.58bit
+
+`python setup_env.py -hr tiiuae/Falcon3-7B-Instruct-1.58bit -q i2_s` (on the Xeon: the download is 13 GB, the f32 intermediate 29.8 GB, the final I2_S file 2.61 GiB, 7.46 B parameters; about 5 minutes). It is the largest instruction-tuned model that bitnet.cpp supports here, but it is a post-training-quantized Falcon3, not a natively trained BitNet (no natively trained BitNet larger than 2B-4T has been published as far as a web search found). On the 2-socket Xeon, 32 threads, `--numa distribute`, `llama-bench` t/s: pp512 153-163, tg128 **37.0 after `--numa-evict`** (21.6 on a cache that was not placed), against Llama3-8B at 33.3 and 2B-4T at 60-69. Sanity checks: it answers "Paris" and "Canberra", writes a correct recursive Fibonacci function and solves the 60 km in 45 minutes problem (80 km/h) with a worked answer. In the RAG demo (above) it answered the repo questions wrongly and confidently (it was given passages the 0.6B embedder did not retrieve), so there the retriever, not the generator, was the limit. Perplexity: 10.97 +/- 0.27 on the WikiText-2 slice, and I2_S loses 0.7% against the f32 GGUF it came from (see [Accuracy](#accuracy)). This copy was converted by hand, so its 29.8 GB `ggml-model-f32.gguf` is still in the model directory (a model fetched by `start_llama.py` has it removed; `utils/cleanup_stale_models.sh` does not know about it).
+
+## Retrieval-augmented generation (RAG)
+
+RAG needs two models: an embedding model to find the relevant text and a chat model to answer from it. The repo has both halves:
+
+```bash
+# once: the I2_S embedding model (Hugging Face repo microsoft/BitNet-embedding-0.6B contains the ready GGUF)
+huggingface-cli download microsoft/BitNet-embedding-0.6B --local-dir models/bitnet-embedding-0.6b
+./start_llama.py --open                       # chat model, port 8080 (key generated, see Launching)
+./start_llama.py --embedding --open           # embedding server, port 8081, same key file
+python utils/rag_demo.py --docs README.md docs/ --host SERVER --api-key-file KEYFILE "How is the API key stored?"
+```
+
+`--embedding` runs `llama-server --embedding` with the 0.6B embedding model from `models/` (the 270M one if that is all there is; `-m` to choose), `-b/-ub 2048` and port 8081 unless `--port` is given; `--local`, `--open`, the key and the firewall handling work as for the chat server. It serves `/v1/embeddings`: 1024-dimension, L2-normalised vectors for the 0.6B model (640 for the 270M). The model card says to give *queries* the instruction `Instruct: <task>\nQuery: <question>` and documents nothing.
+
+`utils/rag_demo.py` (standard library only) is a minimal end-to-end example: it splits files into chunks, embeds them (vectors are cached in `~/.cache/start_llama/rag_vectors.json`), embeds the question, takes the `--top-k` most similar chunks by cosine similarity and asks the chat server to answer from them. It keeps the index in memory; use a vector store for anything large.
+
+Measured on the 2-socket Xeon (32 threads, `--numa distribute`), 0.6B I2_S model over the LAN: about 700 tokens/s of embedding throughput (16 chunks of ~900 characters in 4.8 s, one chunk in 0.3 s); a batch gives the same vector as the text alone (cosine 0.9997); an unauthenticated request gets 401. **Quality is only lightly checked:** 4 of 5 toy questions matched the right sentence, but on this README as a corpus (long, dense bullets) the right passage was in the top 4 for only about 2 of 7 questions and in the top 8 for about 5 of 7 (crude keyword check; chunk sizes of 300-800 characters made no clear difference), and the 2.4B chat model often answered "the context does not contain the answer" even when it did, or answered from its own knowledge. Treat it as a working pipeline, not a tuned one: a cleaner corpus, a cross-encoder reranker, or a larger chat model would be the next steps. The MTEB table in `docs/bitnet-embeddings-i2s-guide.md` was not reproduced.
 
 ## Accuracy
 
@@ -446,6 +485,9 @@ Environments: Python 3.14.6, NumPy 2.5.3, clang 21, x86_64 Linux on the i9-9900;
 - **x86 after the ARM patches (i9-9900, 2026-10-06):** the 11-patch series applies in order on a pristine submodule, and `./build.sh` (which applied `0009`-`0011`) builds with no errors; the AVX2 kernels are unchanged (89 `ymm` instructions in `vec_dot`) and `quantize_i2_s` now lives in `libggml-base`; the unit test prints `ALL OK`; the 2B-4T greedy text is identical with the f16 and the Q8_0 embedding files; the server API test passes 18/18 through `start_llama.py`; perplexity is bit-identical to before (bitnet_b1_58-large 8 chunks 12.9532, 2B-4T 16.6524); generation with the Q8_0 embedding is 27-32% faster in three interleaved rounds on a loaded machine.
 - **Xeon, fresh clone (2026-10-06):** a new clone with an empty submodule; `./build.sh` downloaded 2B-4T (sha256 prefix `4221b252fdd5fd25`, as before) and applied all 11 patches once each, and the files they touch are byte-identical to a single replay of the series on a pristine submodule. No compile errors, `-march=native -O3`, the AVX2 kernels intact (89 `ymm` instructions in `vec_dot`) and no NEON code in the x86 build. The unit test prints `ALL OK`; the server API test passes 18/18 through `start_llama.py` (which chose the Q8_0 file); perplexity matches the i9 to four decimals (12.9532 and 16.6524, and 16.6372 with the Q8_0 embedding); and the speed tables reproduce within run-to-run noise (the one correction is in the NUMA section).
 - **`./build.sh`** was run from a fresh clone, twice, with exit status 0 each time, on the i9-9900 machine, and on the Xeon after two bugs in it were fixed (an interrupted `python -m venv` left a half-built `.venv` that it did not rebuild, and a `nullglob` side effect made its "is a model already there?" check always true, so it never downloaded the model).
+- **Falcon3-7B-Instruct-1.58bit (Xeon, 2026-10-07):** converted with `setup_env.py` and run: correct short answers, 37.0 t/s generation, perplexity 10.97 with I2_S +0.7% against f32 (see [Accuracy](#accuracy)).
+- **Server, embeddings and RAG (Xeon, 2026-10-07):** `start_llama.py --open` (generated key, 401 without it) and `--embedding --open` served over the LAN; the API test passes 19/19 with the key; the 0.6B embedding model gives unit-length 1024-dimension vectors at about 700 tokens/s, and `utils/rag_demo.py` runs end to end (retrieval quality is mediocre, see [RAG](#retrieval-augmented-generation-rag)).
+- **Fetching (i9, 2026-10-07):** `start_llama.py -m falcon-e-1b-base` into an empty directory downloaded, converted and ran the model; the question before an unsuitable fetch was exercised (refused without a terminal or `--yes`).
 
 ## Known issues
 
