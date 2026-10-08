@@ -1,4 +1,4 @@
-"""Find, judge and install a model that is not under models/ yet (used by start_llama.py for `-m NAME`).
+"""Find, judge and install a model that is not under models/ yet (used by birman.py for `-m NAME`).
 
 The catalogue is the model list of setup_env.py (Hugging Face repos it can convert to I2_S) plus the two BitNet
 embedding models (a ready GGUF, downloaded as it is). Installing runs the same steps as by hand:

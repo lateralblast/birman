@@ -6,7 +6,8 @@
     ./birman.py --stop                                                              # stop what --start launched
     ./birman.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf              # llama-server
     ./birman.py --tool cli -m MODEL -p "Hello" -n 64                           # any other llama-* tool
-    ./birman.py --check -m MODEL                                               # report only, run nothing
+    ./birman.py --check -m MODEL                                               # report only, run nothing (also what --build would build or download)
+    ./birman.py --build [-m NAME] [--yes]                                      # build the binaries / fetch the model first if missing
     ./birman.py                                                                # no -m: pick the best model for this machine
 
 It inspects the machine and adds what the measurements in the README support:
@@ -51,6 +52,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+import model_fetch as fetcher  # noqa: E402
 import model_picker as picker  # noqa: E402
 import numa_distribute as numa  # noqa: E402
 
@@ -246,6 +248,8 @@ def parse(argv):
     p.add_argument("--status", action="store_true", help="show whether the --start instance is running: pid, uptime, model, command line, health (exit 0 if running, 1 if not)")
     p.add_argument("--stop", action="store_true", help="stop the instance --start launched (SIGTERM, SIGKILL after 15 s) and exit")
     p.add_argument("--check", "--dry-run", dest="check", action="store_true", help="report the machine and the command, run nothing")
+    p.add_argument("--build", action="store_true", help="run ./build.sh first when needed: when the binaries are absent, and fetch and build the model when -m NAME or models/ finds nothing (--check only reports these steps)")
+    p.add_argument("--yes", action="store_true", help="with --build: do not ask before fetching a model that does not look suitable for this machine")
     p.add_argument("--no-numa", action="store_true", help="do not add --numa distribute on multi-socket machines (also: BITNET_NUMA=0)")
     p.add_argument("--numa-evict", action="store_true", help="evict the model from the page cache first (multi-socket only; also: BITNET_NUMA_EVICT=1)")
     p.add_argument("--models-dir", default=os.path.join(ROOT, "models"), help="where to look for models when -m is not given (default: models/)")
@@ -411,6 +415,56 @@ def start_background(cmd):
     return 0
 
 
+def is_name(value):
+    """-m value that is a model name to look up (not an existing file, not a path, not a .gguf)."""
+    return bool(value) and not os.path.exists(value) and os.sep not in value and not value.endswith(".gguf")
+
+
+def local_match(args, name):
+    hits = [p for p in picker.find_models(args.models_dir) if picker.matches(p, name)]
+    return hits[0] if hits else None
+
+
+def plan_fixes(args, m, binary):
+    """Steps that would supply a missing binary or model: list of (description, kind, payload, judge problems)."""
+    steps = []
+    named = is_name(args.model)
+    if named and local_match(args, args.model):
+        named = False
+    if named:
+        entries = fetcher.catalogue(False) + fetcher.catalogue(True)
+        hit = fetcher.find(args.model, entries, args.prefer)
+        if not hit:
+            print("  no model named %r under %s or in the fetch catalogue" % (args.model, args.models_dir), file=sys.stderr)
+        else:
+            e = hit[0]
+            problems, notes = fetcher.judge(e, m, args.models_dir, args.min_tps, None)
+            sz = fetcher.sizes(e)
+            size = " (about %.1f GiB download, %.1f GiB file)" % (sz["download"], sz["final"]) if sz else ""
+            steps.append(("fetch and build %s from %s%s" % (e["name"], e["repo"], size), "model", e, problems + notes[:0]))
+    if not os.path.isfile(binary) or (not args.model and not picker.find_models(args.models_dir)):
+        steps.insert(0, ("run ./build.sh (builds the binaries; downloads the 2B-4T model when models/ has none)", "build", None, []))
+    return steps
+
+
+def run_fixes(args, steps):
+    """Run plan_fixes steps. Returns False when one failed or was declined."""
+    for desc, kind, payload, problems in steps:
+        print("  %s" % desc, file=sys.stderr)
+        if kind == "build":
+            if subprocess.run([os.path.join(ROOT, "build.sh")], cwd=ROOT).returncode != 0:
+                print("error: ./build.sh failed, see logs/", file=sys.stderr)
+                return False
+            continue
+        for pr in problems:
+            print("  NOTE: " + pr, file=sys.stderr)
+        if problems and not fetcher.confirm("  %s does not look suitable for this machine; fetch it anyway?" % payload["name"], args.yes):
+            return False
+        if not fetcher.install(payload, args.models_dir):
+            return False
+    return True
+
+
 def main(argv=None):
     args, passthrough = parse(sys.argv[1:] if argv is None else argv)
     if args.status:
@@ -426,6 +480,17 @@ def main(argv=None):
     if m["cgroup_limit"] is not None:
         print("  cgroup CPU limit: %.1f CPUs" % m["cgroup_limit"], file=sys.stderr)
 
+    binary = os.path.join(args.bin_dir, TOOLS[args.tool])
+    steps = plan_fixes(args, m, binary)
+    if steps and args.build and not args.check:
+        if not run_fixes(args, steps):
+            return 2
+        steps = []
+    if args.model and is_name(args.model):  # a name: use what is under models/ (also what --build just built)
+        found = local_match(args, args.model)
+        if found:
+            args.model = found
+
     evicted = set()
     if not args.model:
         chosen, evicted = choose_model(args, m, threads)
@@ -436,7 +501,6 @@ def main(argv=None):
     for w in warnings_for(m, model_bytes):
         print("  WARNING: " + w, file=sys.stderr)
 
-    binary = os.path.join(args.bin_dir, TOOLS[args.tool])
     problems = []
     if not os.path.isfile(binary):
         problems.append("%s not found: run ./build.sh first" % binary)
@@ -453,10 +517,16 @@ def main(argv=None):
     if problems and not args.check:
         for pr in problems:
             print("error: " + pr, file=sys.stderr)
+        if not args.build:
+            print("(--build builds the binaries and fetches the model)", file=sys.stderr)
         return 2
     if args.check:
         for pr in problems:
             print("  PROBLEM: " + pr, file=sys.stderr)
+        for desc, _kind, _payload, probs in steps:
+            print("  WOULD (with --build): " + desc, file=sys.stderr)
+            for pr in probs:
+                print("    NOTE: " + pr, file=sys.stderr)
         return 0 if not problems else 2
 
     if numa.evict_requested(args.numa_evict) and "--numa" in cmd and args.model and args.model not in evicted:
