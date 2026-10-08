@@ -77,6 +77,14 @@ and the macOS thread/memory detection in `start_llama.py`.
   the binaries and rewrites the tracked `include/kernel_config.ini` on every fetch. A name only fetches when nothing
   local matches it.
 
+## Model Backup
+
+- [ ] Decide how to back up the GGUFs. `models/` is gitignored and the files are large (2B-4T 1.2 GB, Llama3-8B
+  3.2 GB, bitnet_b1_58-large 269 MB), and GitHub rejects files over 100 MB. Options: Git LFS
+  (`git lfs track "models/**/*.gguf"`, free tier is about 1 GB storage and bandwidth a month, and history keeps
+  everything committed); a Hugging Face model repo; or `rsync` between the dev machines, checking the sha256
+  prefixes in `CLAUDE.md`. For now the models are rebuilt with `./build.sh` / `setup_env.py --hf-repo` or copied by hand.
+
 ## Build
 
 - [ ] OpenMP built with clang against GCC's `libgomp` was about 10x slower on the Xeon (2B-4T pp512 18.8 t/s against

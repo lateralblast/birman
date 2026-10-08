@@ -327,7 +327,7 @@ All differences are well inside the standard errors (0.8-1.1 perplexity points o
 
 *Run 2026-10-05.*
 
-`llama-server` was started with `./birman.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf --port 8089` on both machines and exercised over HTTP with `utils/test_server_api.py` (18 checks, Python standard library only; `python utils/test_server_api.py [--url http://host:port]`, exit status 0 when all pass, 2 if the server cannot be reached). All 18 passed on both:
+`llama-server` was started with `./birman.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf --port 8080` on both machines and exercised over HTTP with `utils/test_server_api.py` (18 checks, Python standard library only; `python utils/test_server_api.py [--url http://host:port]`, exit status 0 when all pass, 2 if the server cannot be reached). All 18 passed on both:
 
 | Check | i9-9900 | 2 x Xeon E5-2682 v4 |
 |---|---|---|

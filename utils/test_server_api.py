@@ -3,8 +3,8 @@
 
 Start the server, then point this at it:
 
-    ./start_llama.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf --port 8089 &
-    python utils/test_server_api.py                       # http://127.0.0.1:8089
+    ./birman.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf --port 8080 &
+    python utils/test_server_api.py                       # http://127.0.0.1:8080
     python utils/test_server_api.py --url http://host:8080
 
 Checks: /health, /v1/models, /props; /completion (answer, n_predict, determinism at temperature 0);
@@ -13,7 +13,7 @@ Checks: /health, /v1/models, /props; /completion (answer, n_predict, determinism
 unknown route, malformed chat request) and that the server is still healthy afterwards.
 
 The answer checks (Paris, Rome, Berlin, Madrid, Tokyo, "Alex") assume a chat-capable model such as
-BitNet-b1.58-2B-4T, whose chat template start_llama.py / run_inference_server.py select automatically; a
+BitNet-b1.58-2B-4T, whose chat template birman.py / run_inference_server.py select automatically; a
 much smaller or base-only model can fail them on content. Exit status 0 means every check passed.
 """
 import argparse
@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 
 _ap = argparse.ArgumentParser(description="Smoke test for a running llama-server.")
-_ap.add_argument("--url", default="http://127.0.0.1:8089", help="server base URL (default: %(default)s)")
+_ap.add_argument("--url", default="http://127.0.0.1:8080", help="server base URL (default: %(default)s)")
 _ap.add_argument("--api-key", default=os.environ.get("LLAMA_API_KEY"), help="API key the server was started with (default: $LLAMA_API_KEY)")
 _ap.add_argument("--api-key-file", help="file with the API key (first non-comment line)")
 _args = _ap.parse_args()
@@ -66,7 +66,7 @@ try:
 except urllib.error.HTTPError:
     pass  # reachable: the checks below report what the server said
 except (urllib.error.URLError, OSError) as e:
-    print("cannot reach the server at %s (%s); start it first, e.g. ./start_llama.py -m MODEL.gguf --port 8089" % (BASE, getattr(e, "reason", e)))
+    print("cannot reach the server at %s (%s); start it first, e.g. ./birman.py -m MODEL.gguf --port 8080" % (BASE, getattr(e, "reason", e)))
     sys.exit(2)
 
 # 1. health
